@@ -1,0 +1,28 @@
+.agents/
+.claude/
+.codegraph/
+.codex/
+.cursor/
+.mcp.json
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Local credentials and environment files
+*.env
+openai.env
+packy.env
+
+# Generated outputs, checkpoints, and large local assets
+outputs/
+sam3/
+third_party/
+scene.ply
+*.ply
+*.pt
+*.pth
+*.ckpt
+
+# Local visual/debug artifacts
+res1.png
+res2.png

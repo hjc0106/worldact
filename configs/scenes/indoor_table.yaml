@@ -1,0 +1,177 @@
+output_dir: outputs/indoor_scene
+
+device:
+  device: cuda
+  dtype: float32
+
+stage1:
+  manual_prompts: []
+
+  vlm:
+    model: gpt-5.5
+    api_base: ${oc.env:OPENAI_API_BASE,''}
+    api_key: ${oc.env:OPENAI_API_KEY,''}
+    num_keyframes: 20
+    max_objects: 20
+    max_retries: 3
+    timeout: 90.0
+    image_max_side: 768
+    prompts:
+      system: >-
+        You identify portable objects that belong to the foreground dining-table
+        cluster in indoor 3D scene renderings. Prioritize the main round table,
+        the vase or flowers on it, the napkin box or tissue box on it, and the
+        chairs immediately around it. Ignore distant background furniture,
+        window frames, wall decor, counters, floor, ceiling, and other scene
+        structure unless an object is directly attached to the table cluster.
+        When multiple objects share the same label, distinguish them using their
+        relative position around the table, such as left, right, center, front,
+        back, near the window, or near the foreground table. Return only valid
+        JSON.
+      user: >-
+        Inspect these multi-view renderings of one scene. Return a JSON array of
+        portable, manipulable object instances centered on the foreground round
+        table and the objects immediately around it. Each item must have keys:
+        "name", "category", "portable", "recognizability", "text_prompt". Focus
+        on the main table, the vase/flowers on the table, the tissue box or
+        napkin holder on the table, and the chairs beside or around that table.
+        Do not generate prompts for far background objects, repeated scenery,
+        or architectural elements. If there are multiple instances of the same
+        object category or label, make each name unique by including a clear
+        position hint in the name and text_prompt, for example:
+        "chair_left_table", "chair_right_table", "chair_front_table",
+        "chair_back_table", "vase_center_table", "napkin_box_center_table".
+        Use recognizability values "precise", "subtle", or "unrecognizable".
+        Keep text_prompt short, concrete, and grounded in the foreground table
+        cluster so it is suitable for SAM3 segmentation. Return at most
+        {max_objects} items.
+
+  sam3:
+    source_dir: third_party/sam3
+    checkpoint_path: sam3/sam3.1_multiplex.pt
+    device: ${device.device}
+    confidence_threshold: 0.45
+    instance_strategy: largest
+    mode: image
+
+  prefilter:
+    enabled: false
+    core_erode_px: 2
+    min_core_area_ratio: 0.2
+    min_view_hits: 2
+    min_hit_ratio: 0.25
+
+  view_propagation:
+    enabled: false
+    max_hops: 2
+    neighbor_top_k: 4
+    max_pose_distance: 1.5
+    max_angle_deg: 45.0
+    min_view_overlap: 0.15
+    anchor_min_score: 0.5
+    anchor_min_area: 0.005
+    anchor_max_area_ratio: 0.35
+    local_sam_weight: 1.0
+    propagated_weight: 0.75
+    geometry_weight: 0.75
+    association_enabled: true
+    candidate_unique_assignment: true
+    fusion_mode: intersection
+    min_assignment_iou: 0.6
+    min_assignment_visibility: 0.25
+    local_mask_dilate_px: 3
+    min_fused_area_ratio: 0.25
+    min_reprojection_iou: 0.2
+    max_depth_error: 0.05
+    track_merge_iou: 0.25
+    min_track_views: 2
+    conflict_suppression: true
+    fallback_to_sam3: false
+    save_debug: true
+
+  soft_assignment:
+    lambda_fp: 2.0
+    threshold: 0.55
+    num_iters: 500
+    lr: 0.01
+    log_interval: 50
+    render_chunk: 3
+    instance_separation:
+      enabled: true
+      core_erode_px: 2
+      ignore_dilate_px: 4
+      min_core_area_ratio: 0.15
+      core_weight: 1.5
+      exclusion_weight: 0.75
+      exclusion_dilate_px: 6
+      exclusion_min_overlap: 0.001
+      exclusion_max_bbox_gap_px: 16
+      adaptive_threshold: true
+      adaptive_threshold_max_delta: 0.08
+      adaptive_threshold_quantile: 0.75
+      adaptive_threshold_min_active_ratio: 0.002
+
+  assignment:
+    method: soft
+    # method: feature_field
+    # feature_field:
+    #   feature_dim: 16
+    #   num_iters: 400
+    #   lr: 0.01
+    #   temperature: 0.07
+    #   threshold: 0.75
+    #   render_chunk: 8
+    #   log_interval: 50
+    #   lambda_mask: 1.0
+    #   lambda_fp: 2.0
+    #   lambda_exclusion: 0.75
+    #   use_background_query: true
+    #   save_feature_field: true
+
+  chunking:
+    enabled: false
+    method: xy_grid
+    bounds_quantile: [0.01, 0.99]
+    target_gaussians_per_chunk: 120000
+    min_chunk_size_xy: 3.5
+    max_chunk_size_xy: 5.0
+    overlap_xy: 0.8
+    min_gaussians_per_chunk: 10000
+    max_chunks: 16
+    merge_iou_threshold: 0.20
+    merge_centroid_distance: 1.0
+
+  camera_gen:
+    trajectory_mode: hybrid
+    auto_center: false
+    center: [2.95, -5.07, 0.80]
+    num_cameras: 40
+    image_width: 768
+    image_height: 768
+    fov_deg: 75.0
+    pitch_deg: 15.0
+    radius_jitter: 0.5
+    height_offset: 0.35
+    orbit_radius: 1.0
+    look_at_center: true
+    keyframe_strategy: diverse
+    keyframe_min_angle_deg: 18.0
+    two_pass: false
+    rings:
+      - name: table_top
+        num_cameras: 16
+        orbit_radius: 1.05
+        height_offset: 0.35
+        look_at_center: true
+      - name: chair_outer
+        num_cameras: 16
+        orbit_radius: 1.85
+        height_offset: 0.05
+        look_at_center: true
+      - name: chair_side
+        num_cameras: 8
+        orbit_radius: 1.55
+        height_offset: 0.10
+        look_at_center: false
+        pitch_deg: -8.0
+        look_at_offset_scale: 0.45

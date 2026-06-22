@@ -1,0 +1,75 @@
+output_dir: outputs/indoor_scene
+
+device:
+  device: cuda
+  dtype: float32
+
+stage1:
+  manual_prompts: []
+
+  vlm:
+    model: gpt-5.5
+    api_base: ${oc.env:OPENAI_API_BASE,''}
+    api_key: ${oc.env:OPENAI_API_KEY,''}
+    num_keyframes: 8
+    max_objects: 20
+    max_retries: 3
+    timeout: 90.0
+    image_max_side: 768
+    prompts:
+      system: >-
+        You identify interactable portable objects in indoor 3D scene renderings.
+        When multiple objects share the same label, distinguish them using their
+        relative position in the scene or image, such as left, right, center,
+        front, back, near window, near table, or similar spatial cues. Return
+        only valid JSON.
+      user: >-
+        Inspect these multi-view renderings of one scene. Return a JSON array of
+        portable, manipulable object instances suitable for object-level
+        decomposition. Each item must have keys: "name", "category", "portable",
+        "recognizability", "text_prompt". If there are multiple instances of the
+        same object category or label, make each name unique by including a clear
+        position hint in the name and text_prompt, for example: "chair_left",
+        "chair_right", "chair_near_window", "chair_center_table". Use
+        recognizability values "precise", "subtle", or "unrecognizable". Return
+        at most {max_objects} items. Do not include walls, floor, ceiling, fixed
+        cabinets, or large architecture.
+
+  sam3:
+    source_dir: third_party/sam3
+    checkpoint_path: sam3/sam3.1_multiplex.pt
+    device: ${device.device}
+    confidence_threshold: 0.45
+    instance_strategy: largest
+    mode: image
+
+  soft_assignment:
+    lambda_fp: 1.0
+    threshold: 0.5
+    num_iters: 500
+    lr: 0.01
+    log_interval: 50
+    render_chunk: 3
+
+  chunking:
+    enabled: false
+    method: xy_grid
+    bounds_quantile: [0.01, 0.99]
+    target_gaussians_per_chunk: 120000
+    min_chunk_size_xy: 3.5
+    max_chunk_size_xy: 5.0
+    overlap_xy: 0.8
+    min_gaussians_per_chunk: 10000
+    max_chunks: 16
+    merge_iou_threshold: 0.20
+    merge_centroid_distance: 1.0
+
+  camera_gen:
+    num_cameras: 16
+    image_width: 512
+    image_height: 512
+    fov_deg: 90.0
+    pitch_deg: 15.0
+    radius_jitter: 0.5
+    height_offset: 0.0
+    center: null

@@ -1,0 +1,196 @@
+output_dir: outputs/outdoor_town_scene
+
+device:
+  device: cuda
+  dtype: float32
+
+stage1:
+  # Leave empty to use VLM discovery. Use --objects to override from the CLI.
+  manual_prompts: []
+
+  vlm:
+    model: gpt-5.5
+    api_base: ${oc.env:OPENAI_API_BASE,''}
+    api_key: ${oc.env:OPENAI_API_KEY,''}
+    num_keyframes: 20
+    max_objects: 20
+    max_retries: 3
+    timeout: 90.0
+    image_max_side: 768
+    prompts:
+      system: >-
+        You identify actionable object instances in outdoor open-air 3D Gaussian
+        scene renderings. The scene may be a street, plaza, garden, park,
+        courtyard, residential exterior, or similar outdoor environment. Focus on
+        compact foreground objects with clear visual boundaries that can be
+        selected, moved, edited, removed, or converted into object-level assets.
+        Treat large immovable structure and scene backdrop as background,
+        including buildings, facades, walls, roofs, ground or terrain mass, sky,
+        and large vegetation regions such as lawns, tree canopies, or hedge masses.
+        When repeated objects appear, distinguish instances with spatial cues such
+        as left, right, center, foreground, background, near a path, beside a
+        building, next to a gate, under a porch, or in a planter bed. Return only
+        valid JSON.
+      user: >-
+        Inspect these {num_keyframes} multi-view renderings of one outdoor scene.
+        Return a JSON array of visible, decomposable object instances suitable for
+        object-level segmentation with SAM3 and 3DGS decomposition. Each item must
+        have keys: "name", "category", "portable", "recognizability",
+        "text_prompt". Prefer objects with clear visual boundaries and stable
+        multi-view evidence, such as benches, chairs, tables, planters, flower
+        pots, lamps, signs, umbrellas, bins, carts, bicycles, scooters, bollards,
+        barrels, crates, statues, garden ornaments, mailboxes, fences, gates, and
+        other compact foreground props. Also include non-portable but separately
+        editable outdoor fixtures when they are compact and well bounded; set
+        "portable" to true for these so the downstream decomposition keeps them.
+        Do not include buildings, facades, walls, roofs, windows as facade parts,
+        doors as building parts, pavement, road surface, sidewalk, sky, water
+        surfaces, terrain, or other large background regions. If benches, pots,
+        lamps, signs, chairs, or tables appear multiple times, make each name
+        unique and place the location hint in both "name" and "text_prompt".
+        The text_prompt must be a concise SAM3 noun phrase that names one object
+        instance and includes appearance plus location, for example "wooden bench
+        near the left garden path", "red flower pot in the foreground planter
+        bed", or "stone lantern beside the courtyard entrance". Use recognizability
+        values "precise", "subtle", or "unrecognizable". Return at most
+        {max_objects} items and no explanatory text outside the JSON array.
+
+  sam3:
+    source_dir: third_party/sam3
+    checkpoint_path: sam3/sam3.1_multiplex.pt
+    device: ${device.device}
+    confidence_threshold: 0.42
+    max_candidates_per_view: 5
+    min_candidate_quality: 0.0
+    instance_strategy: largest
+    mode: image
+
+  candidate_support:
+    enabled: true
+    depth_gate_enabled: true
+    depth_tolerance: 0.08
+    min_alpha: 0.05
+    max_candidates_per_view: 5
+    min_candidate_quality: 0.0
+    component_count_max_points: 4096
+    support_duplicate_iou: 0.45
+    support_duplicate_containment: 0.7
+    identity_suppression_enabled: false
+    identity_suppression_min_reliability_gap: 0.02
+
+  prefilter:
+    enabled: false
+    core_erode_px: 2
+    min_core_area_ratio: 0.2
+    min_view_hits: 2
+    min_hit_ratio: 0.25
+
+  view_propagation:
+    enabled: false
+    max_hops: 2
+    neighbor_top_k: 4
+    max_pose_distance: 1.5
+    max_angle_deg: 45.0
+    min_view_overlap: 0.15
+    anchor_min_score: 0.5
+    anchor_min_area: 0.005
+    anchor_max_area_ratio: 0.35
+    local_sam_weight: 1.0
+    propagated_weight: 0.75
+    geometry_weight: 0.75
+    association_enabled: true
+    candidate_unique_assignment: true
+    fusion_mode: intersection
+    min_assignment_iou: 0.6
+    min_assignment_visibility: 0.25
+    local_mask_dilate_px: 3
+    min_fused_area_ratio: 0.25
+    min_reprojection_iou: 0.2
+    max_depth_error: 0.05
+    track_merge_iou: 0.25
+    min_track_views: 2
+    conflict_min_views: 1
+    conflict_suppression: true
+    fallback_to_sam3: false
+    fallback_to_raw_on_empty_graph: true
+    fallback_to_raw_on_no_association: true
+    save_debug: true
+
+  object_dedup:
+    enabled: false
+    suppress: false
+    mode: adaptive
+    duplicate_score_threshold: 0.62
+    fragment_containment_threshold: 0.85
+    fragment_max_count_ratio: 0.7
+    max_centroid_distance: 1.0
+    min_horizontal_iou: 0.45
+    min_3d_iou: 0.35
+    min_containment: 0.6
+    prefer_larger: true
+    up_axis: y
+
+  soft_assignment:
+    lambda_fp: 2.0
+    threshold: 0.55
+    num_iters: 500
+    lr: 0.01
+    log_interval: 50
+    render_chunk: 3
+    use_mask_reliability_weights: true
+    instance_separation:
+      enabled: true
+      core_erode_px: 2
+      ignore_dilate_px: 4
+      min_core_area_ratio: 0.15
+      core_weight: 1.5
+      exclusion_weight: 0.75
+      exclusion_dilate_px: 6
+      exclusion_min_overlap: 0.001
+      exclusion_max_bbox_gap_px: 16
+      adaptive_threshold: true
+      adaptive_threshold_max_delta: 0.08
+      adaptive_threshold_quantile: 0.75
+      adaptive_threshold_min_active_ratio: 0.002
+
+  assignment:
+    method: soft
+    # method: feature_field
+    # feature_field:
+    #   feature_dim: 16
+    #   num_iters: 400
+    #   lr: 0.01
+    #   temperature: 0.07
+    #   threshold: 0.75
+    #   render_chunk: 8
+    #   log_interval: 50
+    #   lambda_mask: 1.0
+    #   lambda_fp: 2.0
+    #   lambda_exclusion: 0.75
+    #   use_background_query: true
+    #   save_feature_field: true
+
+  chunking:
+    enabled: false
+    method: xy_grid
+    bounds_quantile: [0.01, 0.99]
+    target_gaussians_per_chunk: 120000
+    min_chunk_size_xy: 3.5
+    max_chunk_size_xy: 5.0
+    overlap_xy: 0.8
+    min_gaussians_per_chunk: 10000
+    max_chunks: 16
+    merge_iou_threshold: 0.20
+    merge_centroid_distance: 1.0
+
+  camera_gen:
+    num_cameras: 24
+    image_width: 768
+    image_height: 768
+    fov_deg: 80.0
+    pitch_deg: 15.0
+    radius_jitter: 1.0
+    orbit_radius: 6.0
+    look_at_center: true
+    height_offset: 2.5
+    center: null
