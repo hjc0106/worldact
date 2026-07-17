@@ -5,6 +5,7 @@
 .cursor/
 .mcp.json
 .pytest_cache/
+.pytest_tmp/
 __pycache__/
 *.py[cod]
 
@@ -15,13 +16,26 @@ packy.env
 
 # Generated outputs, checkpoints, and large local assets
 outputs/
-sam3/
+exp/
+sam3
+sv3d
+wonder3d
 third_party/
+artifixer-checkpoints
 scene.ply
 *.ply
 *.pt
 *.pth
 *.ckpt
+*.zip
+
+# Local tooling / temp artifacts
+config.toml
+plan.md
+condaenv.*.requirements.txt
+test.log
+test.png
+test1.png
 
 # Local visual/debug artifacts
 res1.png

@@ -1,0 +1,61 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  artifixer-api:
+    build:
+      context: ../..
+      dockerfile: services/artifixer_service/Dockerfile
+    environment:
+      ARTIFIXER_DATA_ROOT: /data/jobs
+      ARTIFIXER_SERVICE_TOKEN: ${ARTIFIXER_SERVICE_TOKEN:-dev-token}
+      ARTIFIXER_PIPELINE: ${ARTIFIXER_PIPELINE:-stub}
+      ARTIFIXER_REDIS_URL: redis://redis:6379/0
+      ARTIFIXER_USE_REDIS: "0"
+      ARTIFIXER_CHECKPOINT: /models/artifixer/artifixer-14b.pt
+    ports:
+      - "8080:8080"
+    volumes:
+      - artifixer-data:/data/jobs
+      - ${ARTIFIXER_CHECKPOINT_HOST:-./checkpoints/artifixer}:/models/artifixer:ro
+    depends_on:
+      - redis
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  artifixer-worker:
+    build:
+      context: ../..
+      dockerfile: services/artifixer_service/Dockerfile
+    command: ["python3", "-m", "services.artifixer_service.worker"]
+    environment:
+      ARTIFIXER_DATA_ROOT: /data/jobs
+      ARTIFIXER_PIPELINE: ${ARTIFIXER_PIPELINE:-stub}
+      ARTIFIXER_REDIS_URL: redis://redis:6379/0
+      ARTIFIXER_USE_REDIS: "1"
+      ARTIFIXER_CHECKPOINT: /models/artifixer/artifixer-14b.pt
+      ARTIFIXER_ROOT: /opt/ArtiFixer
+    volumes:
+      - artifixer-data:/data/jobs
+      - ${ARTIFIXER_CHECKPOINT_HOST:-./checkpoints/artifixer}:/models/artifixer:ro
+      - ${ARTIFIXER_ROOT_HOST:-./third_party/ArtiFixer}:/opt/ArtiFixer:ro
+    depends_on:
+      - redis
+      - artifixer-api
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  artifixer-data:

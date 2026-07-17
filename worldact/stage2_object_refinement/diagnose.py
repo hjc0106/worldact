@@ -8,6 +8,7 @@ import torch
 from worldact.data.gaussians import GaussianScene
 from worldact.data.masks import ObjectMask
 from worldact.stage2_object_refinement.common import ObjectRefinementConfig, StageObjectRecord
+from worldact.stage2_object_refinement.confidence import compute_foreground_confidence
 
 
 @dataclass
@@ -23,6 +24,12 @@ class ObjectDiagnostics:
     mean_mask_iou: float | None = None
     mean_coverage: float | None = None
     mean_leakage: float | None = None
+    mean_foreground_confidence: float | None = None
+    mean_background_confidence: float | None = None
+    background_structure_ratio: float | None = None
+    mask_support_ratio: float | None = None
+    low_foreground_ratio: float | None = None
+    component_stats: dict[str, Any] | None = None
     rendered_views: int = 0
     render_error: str | None = None
 
@@ -39,6 +46,12 @@ class ObjectDiagnostics:
             "mean_mask_iou": self.mean_mask_iou,
             "mean_coverage": self.mean_coverage,
             "mean_leakage": self.mean_leakage,
+            "mean_foreground_confidence": self.mean_foreground_confidence,
+            "mean_background_confidence": self.mean_background_confidence,
+            "background_structure_ratio": self.background_structure_ratio,
+            "mask_support_ratio": self.mask_support_ratio,
+            "low_foreground_ratio": self.low_foreground_ratio,
+            "component_stats": self.component_stats,
             "rendered_views": self.rendered_views,
             "render_error": self.render_error,
         }
@@ -80,6 +93,14 @@ def diagnose_object(
     )
     if obj_mask is None or not obj_mask.masks:
         return diagnostics
+
+    confidence = compute_foreground_confidence(object_scene, obj_mask, cfg, source_scene=scene)
+    diagnostics.mean_foreground_confidence = confidence.stats.get("mean_foreground_confidence")
+    diagnostics.mean_background_confidence = confidence.stats.get("mean_background_confidence")
+    diagnostics.background_structure_ratio = confidence.stats.get("background_structure_ratio")
+    diagnostics.mask_support_ratio = confidence.stats.get("mean_mask_support_ratio")
+    diagnostics.low_foreground_ratio = confidence.stats.get("low_foreground_ratio")
+    diagnostics.component_stats = confidence.stats.get("component")
 
     ious: list[float] = []
     coverages: list[float] = []

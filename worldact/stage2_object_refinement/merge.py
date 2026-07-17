@@ -45,6 +45,7 @@ def merge_generated_object(
     metadata = _load_metadata(metadata_path)
     generated = _apply_metadata_transform(generated, metadata)
     keep = _generated_keep_mask(refined_scene, generated, obj_mask, cfg, best_view_index=best_view_index)
+    raw_generated = int(generated.num_gaussians)
     kept_generated = generated.subset(keep.nonzero(as_tuple=True)[0])
     if kept_generated.num_gaussians == 0:
         return MergeResult(
@@ -52,8 +53,9 @@ def merge_generated_object(
             stats={
                 "mode": "refined_only_empty_generated_keep",
                 "refined_gaussians": refined_scene.num_gaussians,
-                "generated_gaussians": generated.num_gaussians,
+                "generated_gaussians": raw_generated,
                 "kept_generated_gaussians": 0,
+                "generated_keep_ratio": 0.0,
             },
         )
     blended_params = _blend_overlap_region(
@@ -69,8 +71,9 @@ def merge_generated_object(
         stats={
             "mode": "merged",
             "refined_gaussians": refined_scene.num_gaussians,
-            "generated_gaussians": generated.num_gaussians,
+            "generated_gaussians": raw_generated,
             "kept_generated_gaussians": kept_generated.num_gaussians,
+            "generated_keep_ratio": float(kept_generated.num_gaussians / max(1, raw_generated)),
             "total_gaussians": merged.num_gaussians,
             "duplicate_distance": float(cfg.duplicate_distance),
             "blend_distance": float(cfg.blend_distance),
@@ -112,38 +115,66 @@ def _generated_keep_mask(
     best_view_index: int,
 ) -> torch.Tensor:
     keep = _not_duplicate_mask(refined_scene.params.means, generated_scene.params.means, float(cfg.duplicate_distance))
+    keep = keep & _bbox_keep_mask(refined_scene.params.means, generated_scene.params.means, float(cfg.generated_bbox_expand))
     if obj_mask is None or not obj_mask.masks or not generated_scene.camera_trajectory:
         return keep
-    view_idx = best_view_index if best_view_index in obj_mask.masks else next(iter(obj_mask.masks))
-    if view_idx >= len(generated_scene.camera_trajectory):
+    vote = torch.zeros(generated_scene.num_gaussians, dtype=torch.int32, device=generated_scene.device)
+    visible = torch.zeros(generated_scene.num_gaussians, dtype=torch.int32, device=generated_scene.device)
+    view_indices = sorted(
+        v for v in obj_mask.masks
+        if v < len(generated_scene.camera_trajectory) and v < len(refined_scene.camera_trajectory)
+    )
+    if best_view_index in view_indices:
+        view_indices = [best_view_index] + [v for v in view_indices if v != best_view_index]
+    for view_idx in view_indices:
+        try:
+            refined_render = refined_scene.render(refined_scene.camera_trajectory[view_idx])
+        except Exception:
+            continue
+        valid, px, py, z = project_points(generated_scene, view_idx)
+        if not bool(valid.any()):
+            continue
+        visible += valid.to(dtype=torch.int32)
+        mask = obj_mask.masks[view_idx].to(generated_scene.device).float() > 0.5
+        in_mask = valid & mask[py.clamp(0, mask.shape[0] - 1), px.clamp(0, mask.shape[1] - 1)]
+        alpha = refined_render.alpha.to(generated_scene.device)
+        depth = refined_render.depth.to(generated_scene.device)
+        alpha_at_px = alpha[py.clamp(0, alpha.shape[0] - 1), px.clamp(0, alpha.shape[1] - 1)]
+        depth_at_px = depth[py.clamp(0, depth.shape[0] - 1), px.clamp(0, depth.shape[1] - 1)]
+        high_alpha = alpha_at_px >= float(cfg.render_alpha_threshold)
+        depth_near_object = (z - depth_at_px).abs() <= float(cfg.depth_tolerance) * depth_at_px.abs().clamp(min=0.1)
+        at_surface = high_alpha & depth_near_object
+        rendered_object_mask = mask.to(alpha.device) & (alpha >= float(cfg.render_alpha_threshold))
+        if rendered_object_mask.any():
+            object_depths = depth[rendered_object_mask]
+            z_min = float(object_depths.min())
+            z_max = float(object_depths.max())
+            z_margin = max(0.1, (z_max - z_min) * 0.3)
+        else:
+            z_min = 0.0
+            z_max = float("inf")
+            z_margin = 0.0
+        reasonable_depth = (z >= z_min - z_margin) & (z <= z_max + z_margin)
+        in_gap = ~high_alpha & reasonable_depth
+        vote += (in_mask & (at_surface | in_gap)).to(dtype=torch.int32)
+    if int(visible.max().item()) == 0:
         return keep
-    try:
-        refined_render = refined_scene.render(refined_scene.camera_trajectory[view_idx])
-    except Exception:
-        return keep
-    valid, px, py, z = project_points(generated_scene, view_idx)
-    mask = obj_mask.masks[view_idx].to(generated_scene.device).float() > 0.5
-    in_mask = valid & mask[py.clamp(0, mask.shape[0] - 1), px.clamp(0, mask.shape[1] - 1)]
-    alpha = refined_render.alpha.to(generated_scene.device)
-    depth = refined_render.depth.to(generated_scene.device)
-    alpha_at_px = alpha[py.clamp(0, alpha.shape[0] - 1), px.clamp(0, alpha.shape[1] - 1)]
-    depth_at_px = depth[py.clamp(0, depth.shape[0] - 1), px.clamp(0, depth.shape[1] - 1)]
-    high_alpha = alpha_at_px >= float(cfg.render_alpha_threshold)
-    depth_near_object = (z - depth_at_px).abs() <= float(cfg.depth_tolerance) * depth_at_px.abs().clamp(min=0.1)
-    at_surface = high_alpha & depth_near_object
-    rendered_object_mask = mask.to(alpha.device) & (alpha >= float(cfg.render_alpha_threshold))
-    if rendered_object_mask.any():
-        object_depths = depth[rendered_object_mask]
-        z_min = float(object_depths.min())
-        z_max = float(object_depths.max())
-        z_margin = max(0.1, (z_max - z_min) * 0.3)
-    else:
-        z_min = 0.0
-        z_max = float("inf")
-        z_margin = 0.0
-    reasonable_depth = (z >= z_min - z_margin) & (z <= z_max + z_margin)
-    in_gap = ~high_alpha & reasonable_depth
-    return keep & in_mask & (at_surface | in_gap)
+    support_ratio = vote.float() / visible.clamp(min=1).float()
+    min_votes = min(max(1, int(cfg.generated_min_view_support)), max(1, len(view_indices)))
+    multiview_keep = (vote >= min_votes) | (support_ratio >= float(cfg.generated_min_support_ratio))
+    return keep & multiview_keep
+
+
+def _bbox_keep_mask(refined_means: torch.Tensor, generated_means: torch.Tensor, expand: float) -> torch.Tensor:
+    if refined_means.numel() == 0 or generated_means.numel() == 0:
+        return torch.ones(generated_means.shape[0], dtype=torch.bool, device=generated_means.device)
+    if refined_means.shape[0] < 2:
+        return torch.ones(generated_means.shape[0], dtype=torch.bool, device=generated_means.device)
+    bbox_min = refined_means.min(dim=0).values.to(generated_means.device)
+    bbox_max = refined_means.max(dim=0).values.to(generated_means.device)
+    extent = (bbox_max - bbox_min).clamp(min=1e-6)
+    margin = extent * max(0.0, float(expand))
+    return ((generated_means >= bbox_min - margin) & (generated_means <= bbox_max + margin)).all(dim=1)
 
 
 def _not_duplicate_mask(refined_means: torch.Tensor, generated_means: torch.Tensor, distance: float) -> torch.Tensor:

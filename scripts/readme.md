@@ -49,6 +49,7 @@ conda activate worldact
 | `run_decomposition.py` | Stage 2 核心入口：手动 prompt/VLM + SAM3 + 3DGS assignment |
 | `run_seg.sh` | `run_decomposition.py` 的封装脚本，可用 `OBJECTS=...` 走手动 prompt |
 | `run_seg_vp.sh` | 带 view propagation 默认参数的封装脚本 |
+| `refine_objects.py` | Stage 3 前景目标级 3DGS 补全与细化；支持分阶段 rollout |
 | `visualize_cameras.py` | 检查相机轨迹和 keyframe render，不跑 SAM3/VLM |
 | `render_chunks.py` | 旧版几何网格 chunk 预览和 prompt-guided chunk 筛选，主要作对比/调试 |
 | `convert_gaussianeditor_dataset.py` | 从 GaussianEditor 数据集中导出训练后的标准 3DGS PLY |
@@ -361,33 +362,179 @@ outputs/.../stage1/propagation_stats.json
 
 Stage 3 输入 Stage 2 的 `stage1/` 输出，只处理前景 `object_*.ply` / `objects.json` / `masks.pt` 对应的目标级 3DGS，不训练原始 scene 3DGS，也不处理背景 inpainting。
 
-默认先跑无生成后端版本，用于诊断、剪枝去背景干扰，并导出后续前馈网络需要的 crop package：
+推荐按阶段逐步验证，而不是一次性跑完整 pipeline：
+
+```text
+Stage 2 stage1/
+  -> Phase 1: cleanup_only
+     对象/背景分离 + seed 清理
+     输出 object_refined_seed.ply / object_core.ply / background_reject.ply
+
+  -> Phase 2: generate_only
+     干净视角选择 + 前景化 crop + SV3D pseudo views
+     输出 clean_input.png / multiview_generate/view_*.png
+
+  -> Phase 3: local_refine
+     局部 GS painting/refinement + merge
+     输出 object_*_final.ply / paint_metrics.json
+
+  -> legacy（可选）
+     原始 SV3D + InstantSplat 重建 + merge 全流程
+```
+
+运行前建议固定 CUDA host compiler，避免 `gsplat` 每次 JIT 编译：
 
 ```bash
-python scripts/refine_objects.py \
-  --ply outputs/building/aerial_regions_parking_bev/regions/region_000/chunk.ply \
-  --stage-dir outputs/building/parking_region_000_instance_seg_depthaware_cleanup/stage1 \
-  --output-dir outputs/building/parking_region_000_object_refine \
+export CC=/usr/bin/gcc-11
+export CXX=/usr/bin/g++-11
+export CUDAHOSTCXX=/usr/bin/g++-11
+```
+
+下面示例使用 parking region 的本地验证路径；其他场景请替换 `--ply`、`--stage-dir`、`--output-dir` 和 `--only-object-id`。
+
+### 3.1 Phase 1: 背景分离与 seed 清理
+
+只跑对象/背景分离和 seed 清理，不调用 SV3D。默认启用 adaptive cleanup，会在 `conservative / balanced / strict / very_strict` 之间自动选择清理强度，无需为单个样例手调 bbox 参数。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python scripts/refine_objects.py \
+  --ply outputs/building/aerial_regions_parking_bev_crop/regions/region_000/chunk.ply \
+  --stage-dir outputs/building/parking_region_000_instance_seg_balanced_recall_identitydiag_nearcam_sixrings_allviews/stage1 \
+  --output-dir outputs/building/test_stage2_object_refinement_cleanup_adaptive \
   --device cuda \
   --backend none \
+  --refinement-stage cleanup_only \
+  --only-object-id 1
+```
+
+主要输出：
+
+```text
+outputs/.../object_<id>_<name>/object_refined_seed.ply
+outputs/.../object_<id>_<name>/object_core.ply
+outputs/.../object_<id>_<name>/uncertain_shell.ply
+outputs/.../object_<id>_<name>/background_reject.ply
+outputs/.../object_<id>_<name>/metrics.json
+outputs/.../object_<id>_<name>/separation_metrics.json
+```
+
+`metrics.json` 中会记录 `adaptive_cleanup.selected_policy` 和各候选策略得分。若要关闭自适应、改用手动阈值，可加：
+
+```bash
+--no-adaptive-cleanup \
+--max-off-mask-ratio 0.55 \
+--robust-core-bbox-quantile 0.04 \
+--robust-core-bbox-expand 0.18
+```
+
+建议检查项：
+
+- `background_reject.ply` 是否主要是地面/停车线/邻车噪声。
+- `object_refined_seed.ply` 是否仍保留完整车体主体。
+- `metrics.json` 中 `before/after_prune` 的 `mean_leakage` 是否下降，`mean_coverage` 不要明显下降。
+
+### 3.2 Phase 2: 干净视角选择与 SV3D pseudo views
+
+在 cleanup 基础上，选择干净视角、生成前景化 crop，并调用 SV3D 生成 pseudo views；不做最终 merge。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python scripts/refine_objects.py \
+  --ply outputs/building/aerial_regions_parking_bev_crop/regions/region_000/chunk.ply \
+  --stage-dir outputs/building/parking_region_000_instance_seg_balanced_recall_identitydiag_nearcam_sixrings_allviews/stage1 \
+  --output-dir outputs/building/test_stage2_object_refinement_generate_only \
+  --device cuda \
+  --backend sv3d \
+  --refinement-stage generate_only \
+  --generation-model sv3d \
+  --generation-model-path /home/hongjiacheng/codes/gs_lab/worldact/sv3d \
+  --generation-resolution 512 \
+  --num-generation-views 6 \
+  --only-object-id 1
+```
+
+主要输出：
+
+```text
+outputs/.../object_<id>_<name>/clean_input.png
+outputs/.../object_<id>_<name>/mask.png
+outputs/.../object_<id>_<name>/view_scores.json
+outputs/.../object_<id>_<name>/multiview_generate/view_00.png
+outputs/.../object_<id>_<name>/multiview_generate/pseudo_view_metrics.json
+```
+
+建议检查项：
+
+- `clean_input.png` 应是白底/透明底的单物体前景，不应带明显地面和停车线。
+- `view_scores.json` 中最高分视角应 mask 面积大、背景泄漏低。
+- `multiview_generate/view_*.png` 不应出现明显“玻璃化背景融合”。
+
+### 3.3 Phase 3: 局部 GS 细化与 merge
+
+在 cleanup + SV3D pseudo views 基础上，对对象局部 GS 做 painting/refinement，并输出最终 object PLY。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python scripts/refine_objects.py \
+  --ply outputs/building/aerial_regions_parking_bev_crop/regions/region_000/chunk.ply \
+  --stage-dir outputs/building/parking_region_000_instance_seg_balanced_recall_identitydiag_nearcam_sixrings_allviews/stage1 \
+  --output-dir outputs/building/test_stage2_object_refinement_local_refine \
+  --device cuda \
+  --backend sv3d \
+  --refinement-stage local_refine \
+  --generation-model sv3d \
+  --generation-model-path /home/hongjiacheng/codes/gs_lab/worldact/sv3d \
+  --generation-resolution 512 \
+  --num-generation-views 6 \
+  --local-refine-iterations 80 \
+  --local-refine-lr 0.03 \
+  --only-object-id 1
+```
+
+主要输出：
+
+```text
+outputs/.../object_<id>_<name>/paint_metrics.json
+outputs/.../object_<id>_<name>/object_<id>_<name>_final.ply
+```
+
+### 3.4 Legacy: 原始 SV3D 全流程
+
+如需复现旧的“SV3D 生成 + InstantSplat 重建 + merge”路径，使用：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python scripts/refine_objects.py \
+  --ply outputs/building/aerial_regions_parking_bev_crop/regions/region_000/chunk.ply \
+  --stage-dir outputs/building/parking_region_000_instance_seg_balanced_recall_identitydiag_nearcam_sixrings_allviews/stage1 \
+  --output-dir outputs/building/test_stage2_object_refinement_legacy_sv3d \
+  --device cuda \
+  --backend sv3d \
+  --refinement-stage legacy \
+  --generation-model sv3d \
+  --generation-model-path /home/hongjiacheng/codes/gs_lab/worldact/sv3d \
+  --reconstruction-model instant_splat \
+  --generation-resolution 512 \
+  --num-generation-views 6 \
+  --only-object-id 1
+```
+
+### 3.5 仅诊断：不跑生成后端
+
+如果只想看 prune / separation 效果，不跑 SV3D 或外部网络：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python scripts/refine_objects.py \
+  --ply outputs/building/aerial_regions_parking_bev_crop/regions/region_000/chunk.ply \
+  --stage-dir outputs/building/parking_region_000_instance_seg_balanced_recall_identitydiag_nearcam_sixrings_allviews/stage1 \
+  --output-dir outputs/building/parking_region_000_object_refine_diag \
+  --device cuda \
+  --backend none \
+  --refinement-stage cleanup_only \
   --opacity-min 0.02 \
   --component-radius 1.2 \
   --min-mask-support 1 \
   --depth-tolerance 0.08
 ```
 
-主要输出：
-
-```text
-outputs/.../object_refine/object_metrics.json
-outputs/.../object_refine/object_<id>_<name>/object_refined_seed.ply
-outputs/.../object_refine/object_<id>_<name>/object_<id>_<name>_final.ply
-outputs/.../object_refine/object_<id>_<name>/crop.png
-outputs/.../object_refine/object_<id>_<name>/mask.png
-outputs/.../object_refine/object_<id>_<name>/object_request.json
-```
-
-其中 `object_refined_seed.ply` 是经过 opacity、scale、主连通体、mask/depth consistency 剪枝后的目标 GS；`object_*_final.ply` 在 `--backend none` 时等同于 refined seed。
+### 3.6 外部前馈后端
 
 如果要接入 LGM、CompleteSplat、Splatter Image 等外部前馈后端，使用 `--backend external`。命令会收到 `object_request.json` 路径，并需要在同一个 object 工作目录写出：
 
@@ -399,9 +546,9 @@ metadata.json       # 可选；可包含 {"transform": [[... 4x4 ...]]}
 示例：
 
 ```bash
-python scripts/refine_objects.py \
-  --ply outputs/building/aerial_regions_parking_bev/regions/region_000/chunk.ply \
-  --stage-dir outputs/building/parking_region_000_instance_seg_depthaware_cleanup/stage1 \
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python scripts/refine_objects.py \
+  --ply outputs/building/aerial_regions_parking_bev_crop/regions/region_000/chunk.ply \
+  --stage-dir outputs/building/parking_region_000_instance_seg_balanced_recall_identitydiag_nearcam_sixrings_allviews/stage1 \
   --output-dir outputs/building/parking_region_000_object_refine_lgm \
   --device cuda \
   --backend external \
@@ -410,6 +557,23 @@ python scripts/refine_objects.py \
 ```
 
 外部后端未写出 `generated.ply` 时，流程不会凭空补几何，会保留 deterministic refined object；写出 `generated.ply` 时，只会在目标 mask 内且 refined object 渲染 alpha 较低的区域保守合并 generated splats。
+
+### 3.7 常用参数
+
+| 参数 | 含义 |
+|------|------|
+| `--refinement-stage cleanup_only` | 只跑背景分离和 seed 清理 |
+| `--refinement-stage generate_only` | cleanup + SV3D pseudo views |
+| `--refinement-stage local_refine` | cleanup + pseudo views + 局部 painting |
+| `--refinement-stage legacy` | 原始 SV3D + 重建 + merge 全流程 |
+| `--only-object-id 1` | 只处理单个对象 |
+| `--no-adaptive-cleanup` | 关闭自适应清理，改用手动阈值 |
+| `--max-off-mask-ratio` | off-mask 点拒绝阈值 |
+| `--robust-core-bbox-quantile` | robust core bbox 分位数 |
+| `--robust-core-bbox-expand` | robust core bbox 外扩比例 |
+| `--generation-model-path` | 本地 SV3D 模型目录 |
+| `--reconstruction-model instant_splat` | legacy 模式下的重建后端 |
+| `--local-refine-lr` | 局部 painting 强度 |
 
 ## 辅助调试脚本
 

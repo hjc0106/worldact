@@ -89,15 +89,30 @@ def make_backend(kind: str, command: str | None = None, timeout: float = 600.0, 
         if not command:
             raise ValueError("--backend-command is required when --backend external")
         return ExternalCommandBackend(command, timeout=timeout)
-    if kind == "sv3d":
+    if kind in {"sv3d", "wonder3d"}:
         from worldact.stage2_object_refinement.sv3d_backend import SV3DBackend
         return SV3DBackend(
-            generation_model=kwargs.get("generation_model", "sv3d"),
+            generation_model=kwargs.get("generation_model", "wonder3d" if kind == "wonder3d" else "sv3d"),
+            generation_model_path=kwargs.get("generation_model_path"),
             reconstruction_model=kwargs.get("reconstruction_model", "gs_lrm"),
             inpaint_model=kwargs.get("inpaint_model", "lama"),
             num_generation_views=kwargs.get("num_generation_views", 6),
             generation_resolution=kwargs.get("generation_resolution", 512),
             icp_iterations=kwargs.get("icp_iterations", 50),
             device=kwargs.get("device", "cuda"),
+        )
+    if kind == "artifixer":
+        from worldact.stage2_object_refinement.artifixer_backend import ArtiFixerBackend
+
+        return ArtiFixerBackend(
+            repo=kwargs.get("artifixer_repo"),
+            checkpoint=kwargs.get("artifixer_checkpoint"),
+            python=kwargs.get("artifixer_python", "python"),
+            save_dir=kwargs.get("artifixer_save_dir"),
+            command=kwargs.get("artifixer_command"),
+            render_trajectory=kwargs.get("artifixer_render_trajectory", "trajectory"),
+            timeout=timeout,
+            prompt_path=kwargs.get("artifixer_prompt_path"),
+            num_views=kwargs.get("num_generation_views"),
         )
     raise ValueError(f"Unknown backend: {kind}")

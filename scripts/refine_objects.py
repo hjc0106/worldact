@@ -18,6 +18,8 @@ def main() -> None:
     parser.add_argument("--ply", required=True, help="Input region/chunk PLY used by decomposition")
     parser.add_argument("--stage-dir", required=True, help="Stage1 decomposition directory containing objects.json and masks.pt")
     parser.add_argument("--cameras", default=None, help="Optional cameras.json; defaults to <stage-dir>/background/cameras.json if present")
+    parser.add_argument("--object-ply-dir", default=None, help="Optional directory of target-level object PLY files")
+    parser.add_argument("--object-manifest", default=None, help="Optional JSON manifest with object PLY paths and metadata")
     parser.add_argument("--output-dir", default=None, help="Output directory for object refinement artifacts")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--only-object-id", default=None, help="Process only one object id")
@@ -41,20 +43,62 @@ def main() -> None:
     parser.add_argument("--blend-distance", type=float, default=0.05)
     parser.add_argument("--num-generation-views", type=int, default=6)
     parser.add_argument("--generation-resolution", type=int, default=512)
-    parser.add_argument("--generation-model", default="sv3d", choices=["sv3d", "zero123plus"])
+    parser.add_argument("--generation-model", default="sv3d", choices=["sv3d", "wonder3d", "zero123plus", "scene_multiview"])
+    parser.add_argument("--generation-model-path", default=None, help="Optional local path for the generation model")
+    parser.add_argument("--wonder3d-crop-size", type=int, default=192)
+    parser.add_argument("--wonder3d-guidance-scale", type=float, default=1.0)
     parser.add_argument("--reconstruction-model", default="gs_lrm", choices=["gs_lrm", "instant_splat"])
     parser.add_argument("--inpaint-model", default="lama", choices=["lama", "none"])
     parser.add_argument("--icp-iterations", type=int, default=50)
-    parser.add_argument("--backend", choices=["none", "external", "sv3d"], default="none")
+    parser.add_argument("--no-foreground-confidence", action="store_true")
+    parser.add_argument("--min-foreground-confidence", type=float, default=0.35)
+    parser.add_argument("--background-confidence-threshold", type=float, default=0.65)
+    parser.add_argument("--background-structure-quantile", type=float, default=0.15)
+    parser.add_argument("--background-structure-distance", type=float, default=0.08)
+    parser.add_argument("--foreground-core-quantile", type=float, default=0.35)
+    parser.add_argument("--no-adaptive-cleanup", action="store_true")
+    parser.add_argument("--max-off-mask-ratio", type=float, default=0.55)
+    parser.add_argument("--robust-core-bbox-quantile", type=float, default=0.04)
+    parser.add_argument("--robust-core-bbox-expand", type=float, default=0.18)
+    parser.add_argument("--generated-min-view-support", type=int, default=2)
+    parser.add_argument("--generated-min-support-ratio", type=float, default=0.5)
+    parser.add_argument("--generated-bbox-expand", type=float, default=0.25)
+    parser.add_argument("--backend", choices=["none", "external", "sv3d", "wonder3d", "artifixer"], default="none")
     parser.add_argument("--backend-command", default=None, help="External command; use {request} and {workdir} placeholders if needed")
     parser.add_argument("--backend-timeout", type=float, default=600.0)
+    parser.add_argument("--artifixer-repo", default=None, help="Path to the official nv-tlabs/ArtiFixer repository")
+    parser.add_argument("--artifixer-checkpoint", default=None, help="Path to artifixer-*.pt checkpoint")
+    parser.add_argument("--artifixer-python", default="python", help="Python executable inside the ArtiFixer environment")
+    parser.add_argument("--artifixer-save-dir", default=None, help="Optional ArtiFixer inference output root")
+    parser.add_argument(
+        "--artifixer-command",
+        default=None,
+        help="Optional command template; supports {split}, {save_dir}, {checkpoint}, {repo}, {workdir}, {scene_id}",
+    )
+    parser.add_argument("--artifixer-prompt-path", default=None, help="Optional precomputed ArtiFixer caption HDF5")
+    parser.add_argument(
+        "--artifixer-render-trajectory",
+        default="trajectory",
+        choices=["trajectory", "all_frames", "val_frames"],
+        help="ArtiFixer model_eval.run_inference render_trajectory mode",
+    )
+    parser.add_argument(
+        "--refinement-stage",
+        default="legacy",
+        choices=["legacy", "cleanup_only", "generate_only", "local_refine"],
+        help="Stage2 rollout mode: legacy full merge, cleanup only, pseudo-view generation, or local refinement",
+    )
+    parser.add_argument("--local-refine-iterations", type=int, default=80)
+    parser.add_argument("--local-refine-lr", type=float, default=0.03)
     args = parser.parse_args()
 
     setup_logging("INFO")
+    generation_model = "wonder3d" if args.backend == "wonder3d" and args.generation_model == "sv3d" else args.generation_model
     stage_dir = Path(args.stage_dir)
     cameras = _resolve_cameras(stage_dir, args.cameras)
     output_dir = Path(args.output_dir) if args.output_dir else stage_dir.parent / "stage2_object_refinement"
     cfg = ObjectRefinementConfig(
+        refinement_stage=args.refinement_stage,
         opacity_min=float(args.opacity_min),
         max_world_scale=float(args.max_world_scale),
         component_radius=float(args.component_radius),
@@ -75,20 +119,53 @@ def main() -> None:
         blend_distance=float(args.blend_distance),
         num_generation_views=int(args.num_generation_views),
         generation_resolution=int(args.generation_resolution),
-        generation_model=args.generation_model,
+        generation_model=generation_model,
+        generation_model_path=args.generation_model_path,
+        wonder3d_crop_size=int(args.wonder3d_crop_size),
+        wonder3d_guidance_scale=float(args.wonder3d_guidance_scale),
         reconstruction_model=args.reconstruction_model,
         inpaint_model=args.inpaint_model,
         icp_iterations=int(args.icp_iterations),
+        use_foreground_confidence=not bool(args.no_foreground_confidence),
+        min_foreground_confidence=float(args.min_foreground_confidence),
+        background_confidence_threshold=float(args.background_confidence_threshold),
+        background_structure_quantile=float(args.background_structure_quantile),
+        background_structure_distance=float(args.background_structure_distance),
+        foreground_core_quantile=float(args.foreground_core_quantile),
+        adaptive_cleanup=not bool(args.no_adaptive_cleanup),
+        max_off_mask_ratio=float(args.max_off_mask_ratio),
+        robust_core_bbox_quantile=float(args.robust_core_bbox_quantile),
+        robust_core_bbox_expand=float(args.robust_core_bbox_expand),
+        generated_min_view_support=int(args.generated_min_view_support),
+        generated_min_support_ratio=float(args.generated_min_support_ratio),
+        generated_bbox_expand=float(args.generated_bbox_expand),
+        local_refine_iterations=int(args.local_refine_iterations),
+        local_refine_lr=float(args.local_refine_lr),
     )
-    stage_input = load_stage_input(Path(args.ply), stage_dir, cameras_path=cameras, device=str(args.device))
+    stage_input = load_stage_input(
+        Path(args.ply),
+        stage_dir,
+        cameras_path=cameras,
+        object_ply_dir=Path(args.object_ply_dir) if args.object_ply_dir else None,
+        object_manifest=Path(args.object_manifest) if args.object_manifest else None,
+        device=str(args.device),
+    )
     backend_kwargs = {
-        "generation_model": args.generation_model,
+        "generation_model": generation_model,
+        "generation_model_path": args.generation_model_path,
         "reconstruction_model": args.reconstruction_model,
         "inpaint_model": args.inpaint_model,
         "num_generation_views": int(args.num_generation_views),
         "generation_resolution": int(args.generation_resolution),
         "icp_iterations": int(args.icp_iterations),
         "device": args.device,
+        "artifixer_repo": args.artifixer_repo,
+        "artifixer_checkpoint": args.artifixer_checkpoint,
+        "artifixer_python": args.artifixer_python,
+        "artifixer_save_dir": args.artifixer_save_dir,
+        "artifixer_command": args.artifixer_command,
+        "artifixer_prompt_path": args.artifixer_prompt_path,
+        "artifixer_render_trajectory": args.artifixer_render_trajectory,
     }
     backend = make_backend(args.backend, command=args.backend_command, timeout=float(args.backend_timeout), **backend_kwargs)
     result = refine_stage_objects(stage_input, output_dir, cfg, backend, only_object_id=args.only_object_id)

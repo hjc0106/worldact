@@ -1,0 +1,22 @@
+device: cpu
+
+prepare:
+  anchor_count: 6
+  min_anchor_count: 3
+  target_count: 32
+  image_size: 512
+  base_reconstruction_steps: 1000
+  distillation_steps: 5000
+  run_artifixer3d_plus: false
+  model: artifixer-14b
+
+artifixer_service:
+  base_url: http://artifixer-server:8080
+  token_env: ARTIFIXER_SERVICE_TOKEN
+  request_timeout_seconds: 60
+  job_timeout_seconds: 21600
+  poll_interval_seconds: 10
+  verify_tls: true
+  model: artifixer-14b
+  distillation_steps: 5000
+  run_artifixer3d_plus: false

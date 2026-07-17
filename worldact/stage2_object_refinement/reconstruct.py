@@ -137,15 +137,59 @@ def _reconstruct_instant_splat(
     device: str,
 ) -> ReconstructResult:
     try:
-        return _run_instant_splat_inference(multiview_images, cameras_json_path, output_ply,
-                                            metadata_path, work_dir, resolution, device)
+        result = _run_instant_splat_inference(
+            multiview_images,
+            cameras_json_path,
+            output_ply,
+            metadata_path,
+            work_dir,
+            resolution,
+            device,
+        )
+        if result.ply_path is not None:
+            return result
     except ImportError:
         pass
+    if cameras_json_path and cameras_json_path.exists() and multiview_images:
+        return _fallback_point_cloud(
+            multiview_images,
+            cameras_json_path,
+            output_ply,
+            metadata_path,
+            resolution,
+            device,
+        )
     return ReconstructResult(
         ply_path=None,
         metadata_path=None,
         stats={"model": "none", "num_gaussians": 0, "fallback": "instant_splat_not_installed"},
     )
+
+
+def _instant_splat_python() -> str:
+    import os
+    import sys
+    from pathlib import Path
+
+    env_python = os.environ.get("INSTANT_SPLAT_PYTHON")
+    if env_python:
+        return env_python
+    default = Path.home() / "miniconda3/envs/instantsplat/bin/python"
+    if default.exists():
+        return str(default)
+    return sys.executable
+
+
+def _instant_splat_env() -> dict[str, str]:
+    import os
+
+    env = os.environ.copy()
+    if "INSTANT_SPLAT_ROOT" not in env:
+        repo_root = Path(__file__).resolve().parents[2]
+        instantsplat_root = repo_root / "third_party" / "InstantSplat"
+        if instantsplat_root.exists():
+            env["INSTANT_SPLAT_ROOT"] = str(instantsplat_root)
+    return env
 
 
 def _run_instant_splat_inference(
@@ -158,33 +202,47 @@ def _run_instant_splat_inference(
     device: str,
 ) -> ReconstructResult:
     import subprocess
-    import sys
 
+    python = _instant_splat_python()
     cmd = [
-        sys.executable, "-m", "instant_splat",
+        python, "-m", "instant_splat",
         "--images", str(work_dir / "multiview_generate"),
         "--output", str(work_dir / "instant_splat_out"),
         "--resolution", str(resolution),
+        "--device", device,
     ]
     if cameras_json_path:
         cmd.extend(["--cameras", str(cameras_json_path)])
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        env=_instant_splat_env(),
+    )
 
     inst_out = work_dir / "instant_splat_out" / "point_cloud.ply"
-    if inst_out.exists():
+    if inst_out.exists() and inst_out.stat().st_size > 0:
         import shutil
         shutil.copy2(str(inst_out), str(output_ply))
-    else:
-        output_ply.touch()
-
-    metadata = {"transform": torch.eye(4).tolist(), "source": "instant_splat"}
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
+        metadata = {"transform": torch.eye(4).tolist(), "source": "instant_splat"}
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+        return ReconstructResult(
+            ply_path=output_ply,
+            metadata_path=metadata_path,
+            stats={"model": "instant_splat", "returncode": result.returncode},
+        )
 
     return ReconstructResult(
-        ply_path=output_ply,
-        metadata_path=metadata_path,
-        stats={"model": "instant_splat", "returncode": result.returncode},
+        ply_path=None,
+        metadata_path=None,
+        stats={
+            "model": "instant_splat",
+            "returncode": result.returncode,
+            "fallback": "instant_splat_no_output",
+            "stderr": result.stderr[-500:] if result.stderr else "",
+        },
     )
 
 
