@@ -129,9 +129,22 @@ def select_and_export_anchors(
     for i, item in enumerate(exported[: cfg.anchor_count]):
         rgb_name = f"frame_{i:03d}.png"
         mask_name = f"frame_{i:03d}_mask.png"
-        Image.fromarray(item.rgb).save(anchors_dir / rgb_name)
-        Image.fromarray(item.mask, mode="L").save(anchors_dir / mask_name)
         k = item.camera_local.intrinsic
+        rgb_np, mask_np, fl_x, fl_y, cx, cy = _reframe_crop_to_principal_point(
+            item.rgb,
+            item.mask,
+            fl_x=float(k[0, 0]),
+            fl_y=float(k[1, 1]),
+            cx=float(k[0, 2]),
+            cy=float(k[1, 2]),
+            image_size=cfg.image_size,
+        )
+        Image.fromarray(rgb_np).save(anchors_dir / rgb_name)
+        Image.fromarray(mask_np, mode="L").save(anchors_dir / mask_name)
+        if not (0.0 < cx < float(cfg.image_size) and 0.0 < cy < float(cfg.image_size)):
+            raise ValueError(
+                f"anchor {i} principal point still out of bounds after reframe: cx={cx}, cy={cy}"
+            )
         anchors.append(
             AnchorCamera(
                 index=i,
@@ -139,10 +152,10 @@ def select_and_export_anchors(
                 rgb_path=f"anchors/{rgb_name}",
                 mask_path=f"anchors/{mask_name}",
                 transform_matrix=c2w_matrix_list(item.camera_local),
-                fl_x=float(k[0, 0]),
-                fl_y=float(k[1, 1]),
-                cx=float(k[0, 2]),
-                cy=float(k[1, 2]),
+                fl_x=fl_x,
+                fl_y=fl_y,
+                cx=cx,
+                cy=cy,
                 w=cfg.image_size,
                 h=cfg.image_size,
                 mask_area_ratio=item.mask_area_ratio,
@@ -333,11 +346,60 @@ def crop_object_square(
     return resized_rgb, resized_mask, new_k
 
 
+def _reframe_crop_to_principal_point(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    *,
+    fl_x: float,
+    fl_y: float,
+    cx: float,
+    cy: float,
+    image_size: int,
+    margin: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, float, float, float, float]:
+    """Pad-then-resize so the principal point lies inside the square image."""
+    w = h = int(image_size)
+    if 0.0 < cx < float(w) and 0.0 < cy < float(h):
+        return rgb, mask, fl_x, fl_y, cx, cy
+
+    pad_l = max(0, int(math.ceil(margin - cx)))
+    pad_t = max(0, int(math.ceil(margin - cy)))
+    pad_r = max(0, int(math.ceil(cx + margin - float(w))))
+    pad_b = max(0, int(math.ceil(cy + margin - float(h))))
+    canvas_w = w + pad_l + pad_r
+    canvas_h = h + pad_t + pad_b
+    rgb_img = Image.fromarray(rgb)
+    mask_img = Image.fromarray(mask, mode="L")
+    if rgb_img.size != (w, h):
+        rgb_img = rgb_img.resize((w, h), Image.Resampling.BILINEAR)
+        mask_img = mask_img.resize((w, h), Image.Resampling.NEAREST)
+    rgb_canvas = Image.new("RGB", (canvas_w, canvas_h), color=(0, 0, 0))
+    mask_canvas = Image.new("L", (canvas_w, canvas_h), color=0)
+    rgb_canvas.paste(rgb_img, (pad_l, pad_t))
+    mask_canvas.paste(mask_img, (pad_l, pad_t))
+    rgb_out = np.asarray(rgb_canvas.resize((w, h), Image.Resampling.BILINEAR))
+    mask_out = np.asarray(mask_canvas.resize((w, h), Image.Resampling.NEAREST))
+    sx = float(w) / float(canvas_w)
+    sy = float(h) / float(canvas_h)
+    return (
+        rgb_out,
+        mask_out,
+        fl_x * sx,
+        fl_y * sy,
+        (cx + pad_l) * sx,
+        (cy + pad_t) * sy,
+    )
+
+
 def _render_rgb_alpha(scene: GaussianScene, camera: CameraPose) -> tuple[torch.Tensor, torch.Tensor]:
     try:
         view = scene.render(camera)
         return view.rgb, view.alpha
-    except Exception:
+    except Exception as exc:
+        if scene.device.type != "cpu":
+            raise RuntimeError(
+                f"anchor rendering failed on {scene.device}; refusing to generate gray fallback images"
+            ) from exc
         # CPU / no-gsplat fallback for packaging tests: flat gray + projected coverage.
         h, w = camera.height, camera.width
         rgb = torch.full((h, w, 3), 0.5, device=camera.extrinsic.device)

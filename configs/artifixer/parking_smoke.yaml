@@ -1,0 +1,26 @@
+device: cuda
+
+prepare:
+  anchor_count: 3
+  min_anchor_count: 3
+  target_count: 4
+  horizontal_targets: 4
+  high_elevation_targets: 0
+  low_elevation_targets: 0
+  image_size: 512
+  min_mask_area_ratio: 0.001
+  max_mask_area_ratio: 0.8
+  # 10 steps is enough to exercise the official path quickly but often fails
+  # geometry validation (radius explosion). Use 100 for a green parking smoke.
+  base_reconstruction_steps: 10
+  distillation_steps: 100
+  model: artifixer-14b
+
+artifixer_service:
+  # Overridable via ARTIFIXER_SERVICE_URL (e.g. http://127.0.0.1:8001).
+  base_url: http://127.0.0.1:8000
+  token_env: ARTIFIXER_SERVICE_TOKEN
+  poll_interval_seconds: 2
+  job_timeout_seconds: 21600
+  verify_tls: true
+  distillation_steps: 100

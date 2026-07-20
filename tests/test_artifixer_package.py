@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 from worldact.data.gaussians import GaussianParams, GaussianScene
 from worldact.data.masks import MaskSet, ObjectMask
 from worldact.data.poses import CameraPose
+from worldact.rendering.rasterizer import _ensure_ninja_on_path
+from worldact.stage2_artifixer.anchors import _render_rgb_alpha
 from worldact.stage2_artifixer.config import PrepareConfig
 from worldact.stage2_artifixer.inputs import load_stage_artifixer_input
 from worldact.stage2_artifixer.package import archive_package, prepare_object_package
@@ -109,3 +114,32 @@ def test_prepare_object_package(tmp_path: Path) -> None:
     assert result.ok, result.errors
     archive = archive_package(package_dir)
     assert archive.exists() and archive.stat().st_size > 0
+
+
+def test_ninja_beside_active_python_is_added_to_path(monkeypatch) -> None:
+    ninja = Path(sys.executable).resolve().parent / "ninja"
+    if not ninja.is_file():
+        pytest.skip("active Python environment does not provide Ninja")
+    monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))
+
+    _ensure_ninja_on_path()
+
+    assert os.environ["PATH"].split(os.pathsep)[0] == str(ninja.parent)
+
+
+def test_cuda_anchor_render_failure_does_not_fallback() -> None:
+    class BrokenCudaScene:
+        device = torch.device("cuda")
+
+        def render(self, _camera):
+            raise RuntimeError("synthetic CUDA failure")
+
+    camera = CameraPose(
+        extrinsic=torch.eye(4),
+        intrinsic=torch.eye(3),
+        width=8,
+        height=8,
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to generate gray fallback"):
+        _render_rgb_alpha(BrokenCudaScene(), camera)  # type: ignore[arg-type]

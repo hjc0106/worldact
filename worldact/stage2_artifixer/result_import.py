@@ -62,6 +62,9 @@ def import_refined_result(
     if manifest_path.exists():
         manifest = ArtifactManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
         for item in manifest.files:
+            # Manifest must not checksum itself; skip legacy self-entries defensively.
+            if item.path in {"artifact_manifest.json", "./artifact_manifest.json"}:
+                continue
             path = artifact_dir / item.path
             if not path.exists():
                 messages.append(f"missing artifact {item.path}")

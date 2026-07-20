@@ -26,6 +26,8 @@ class ArtiFixerRemoteClient:
             timeout=self.config.request_timeout_seconds,
             verify=self.config.verify_tls,
             headers=self._headers(),
+            # Host http_proxy must not intercept 127.0.0.1 service calls.
+            trust_env=False,
         )
 
     def close(self) -> None:
@@ -36,6 +38,15 @@ class ArtiFixerRemoteClient:
 
     def __exit__(self, *args) -> None:
         self.close()
+
+    def health(self) -> dict:
+        """Probe service liveness (/healthz, fallback /health)."""
+        for path in ("/healthz", "/health"):
+            response = self._client.get(path)
+            if response.status_code == 200:
+                return response.json()
+        response.raise_for_status()
+        return {}
 
     def submit(self, package_archive: Path | str, idempotency_key: str, *, manifest_json: str | None = None) -> JobCreateResponse:
         package_archive = Path(package_archive)

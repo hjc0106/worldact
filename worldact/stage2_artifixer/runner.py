@@ -213,10 +213,19 @@ class ArtiFixerRefinementRunner:
             self.object_dir,
             input_local_ply=package_dir / "object_local.ply",
         )
+        refinement_meta: dict[str, Any] = {}
+        summary_path = artifact_dir / "refinement_summary.json"
+        if summary_path.exists():
+            try:
+                refinement_meta = json.loads(summary_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                refinement_meta = {}
         (self.object_dir / "import_summary.json").write_text(
             json.dumps(
                 {
                     "status": result.status,
+                    "pipeline": refinement_meta.get("pipeline") or refinement_meta.get("mode"),
+                    "refinement_applied": refinement_meta.get("refinement_applied"),
                     "refined_local_ply": str(result.refined_local_ply) if result.refined_local_ply else None,
                     "refined_world_ply": str(result.refined_world_ply) if result.refined_world_ply else None,
                     "messages": result.messages,

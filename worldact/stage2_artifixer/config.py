@@ -36,7 +36,10 @@ class PrepareConfig:
 
 @dataclass
 class ArtiFixerServiceConfig:
-    base_url: str = "http://artifixer-server:8080"
+    # Default points at the ArtiFixer Docker service (host port 8000).
+    base_url: str = field(
+        default_factory=lambda: os.environ.get("ARTIFIXER_SERVICE_URL", "http://127.0.0.1:8000")
+    )
     token_env: str = "ARTIFIXER_SERVICE_TOKEN"
     request_timeout_seconds: float = 60.0
     job_timeout_seconds: float = 21600.0
@@ -48,6 +51,10 @@ class ArtiFixerServiceConfig:
 
     def auth_token(self) -> str | None:
         return os.environ.get(self.token_env) or None
+
+    def health_url(self) -> str:
+        """Prefer /healthz (WorldAct contract); /health remains for legacy probes."""
+        return f"{self.base_url.rstrip('/')}/healthz"
 
 
 @dataclass
@@ -76,6 +83,10 @@ def _from_dict(raw: dict[str, Any]) -> ArtiFixerRefinementConfig:
     service = ArtiFixerServiceConfig(
         **{k: v for k, v in service_raw.items() if k in ArtiFixerServiceConfig.__dataclass_fields__}
     )
+    # Env wins over YAML so smoke can retarget port without editing configs.
+    env_url = os.environ.get("ARTIFIXER_SERVICE_URL")
+    if env_url:
+        service.base_url = env_url
     return ArtiFixerRefinementConfig(
         prepare=prepare,
         service=service,

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import math
+import os
+import shutil
+import sys
+from pathlib import Path
 
 import torch
 
@@ -8,6 +12,18 @@ from worldact.data.gaussians import GaussianScene, RenderedView
 from worldact.data.poses import CameraPose
 
 SH_C0 = 0.28209479177387814
+
+
+def _ensure_ninja_on_path() -> None:
+    """Expose Ninja installed beside the active Python to PyTorch JIT builds."""
+    if shutil.which("ninja") is not None:
+        return
+    python_bin = Path(sys.executable).resolve().parent
+    ninja = python_bin / "ninja"
+    if not ninja.is_file():
+        return
+    current_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = str(python_bin) + (os.pathsep + current_path if current_path else "")
 
 
 def _prepared_params(scene: GaussianScene) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int | None]:
@@ -51,6 +67,7 @@ def _prepared_params(scene: GaussianScene) -> tuple[torch.Tensor, torch.Tensor, 
 
 
 def rasterize(scene: GaussianScene, camera: CameraPose) -> RenderedView:
+    _ensure_ninja_on_path()
     try:
         from gsplat import rasterization
     except ImportError as exc:

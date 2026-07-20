@@ -11,7 +11,9 @@ prepare:
   model: artifixer-14b
 
 artifixer_service:
-  base_url: http://artifixer-server:8080
+  # Host-mapped ArtiFixer Docker service (see ArtiFixer/run_svc.sh).
+  # Override with ARTIFIXER_SERVICE_URL or --service-url.
+  base_url: http://127.0.0.1:8000
   token_env: ARTIFIXER_SERVICE_TOKEN
   request_timeout_seconds: 60
   job_timeout_seconds: 21600
