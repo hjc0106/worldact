@@ -61,6 +61,7 @@ from worldact.stage2_artifixer.trajectory import (
     resolve_front_axis,
     resolve_up_axis,
 )
+from worldact.stage2_artifixer.up_axis import write_up_axis_json
 from worldact.stage2_artifixer.contracts import AnchorsDocument
 
 
@@ -80,6 +81,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anchor-count", type=int, default=5)
     parser.add_argument("--front-yaw-deg", type=float, default=0.0)
     parser.add_argument("--front-axis", type=float, nargs=3, default=None)
+    parser.add_argument(
+        "--up-axis",
+        type=float,
+        nargs=3,
+        default=None,
+        help="Manual upright axis in object-local coords (skips auto estimation).",
+    )
+    parser.add_argument(
+        "--stage-dir",
+        type=Path,
+        default=None,
+        help="Stage-1 directory with background/gaussians.ply for scene-ground up.",
+    )
+    parser.add_argument(
+        "--min-up-confidence",
+        type=float,
+        default=0.45,
+        help="Abort if auto up-axis confidence is below this (unless --up-axis set).",
+    )
     parser.add_argument("--front-azimuth-half-span", type=float, default=110.0)
     parser.add_argument("--ring-elevation-deg", type=float, default=20.0)
     parser.add_argument("--circumradius-scale", type=float, default=1.25)
@@ -124,10 +144,53 @@ def main(argv: list[str] | None = None) -> int:
     cfg = _build_config(args)
     import torch
 
-    points = torch.as_tensor(_read_ply_xyz(ply_path), dtype=torch.float32)
+    from worldact.stage2_artifixer.up_axis import _load_gaussian_xyz_opacity_scales
+
+    means_np, opac_np, scales_np = _load_gaussian_xyz_opacity_scales(ply_path)
+    points = torch.as_tensor(means_np, dtype=torch.float32)
+    opacities = None if opac_np is None else torch.as_tensor(opac_np, dtype=torch.float32)
+    scales = None if scales_np is None else torch.as_tensor(scales_np, dtype=torch.float32)
     up_hint = estimate_up_from_opengl_frames(source_transforms["frames"], indices=source_selected)
-    up_axis = resolve_up_axis(cfg, points_local=points, up_hint=up_hint)
+    local_to_world = None
+    norm_path = source / "normalization.json"
+    if norm_path.is_file():
+        norm = _load_json(norm_path)
+        if "local_to_world" in norm:
+            local_to_world = torch.as_tensor(norm["local_to_world"], dtype=torch.float32)
+    camera_centers_local = None
+    if source_transforms.get("frames"):
+        cams = []
+        for i in source_selected:
+            mat = np.asarray(source_transforms["frames"][int(i)]["transform_matrix"], dtype=np.float64)
+            cams.append(mat[:3, 3])
+        if cams:
+            # transforms.json is OpenGL; centers are still valid positions in local frame.
+            camera_centers_local = torch.as_tensor(np.stack(cams, axis=0), dtype=torch.float32)
+
+    stage_dir = str(args.stage_dir.resolve()) if args.stage_dir is not None else cfg.stage_dir
+    up_axis, up_estimate = resolve_up_axis(
+        cfg,
+        points_local=points,
+        up_hint=up_hint,
+        stage_dir=stage_dir,
+        local_to_world=local_to_world,
+        camera_centers_local=camera_centers_local,
+        opacities=opacities,
+        scales=scales,
+        return_estimate=True,
+    )
+    if args.up_axis is None and float(up_estimate.confidence) < float(args.min_up_confidence):
+        raise RuntimeError(
+            f"up-axis confidence {up_estimate.confidence:.3f} < {args.min_up_confidence:.3f} "
+            f"(source={up_estimate.source}). Pass --up-axis or lower --min-up-confidence."
+        )
+    # Lock the estimated axis into cfg so later build_target_trajectory reuse matches.
+    cfg.up_axis = tuple(float(x) for x in up_axis.tolist())
     front_axis = resolve_front_axis(cfg, points_local=points, up_axis=up_axis)
+    print(
+        f"[up_axis] source={up_estimate.source} confidence={up_estimate.confidence:.3f} "
+        f"sign={up_estimate.sign_source} axis={up_estimate.up_axis}"
+    )
 
     empty_anchors = AnchorsDocument(schema_version="1.0", image_size=cfg.image_size, anchors=[])
     trajectory = build_target_trajectory(
@@ -183,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copy2(source / "normalization.json", output / "normalization.json")
     shutil.copy2(caption_src, captions_dir / "caption.h5")
     _validate_caption_h5(captions_dir / "caption.h5")
+    write_up_axis_json(output / "up_axis.json", up_estimate)
 
     frame_specs: list[dict[str, Any]] = []
     for i, frame in enumerate(trajectory.frames):
@@ -367,9 +431,12 @@ def main(argv: list[str] | None = None) -> int:
         "render_stats": render_stats,
         "caption": {k: caption_info[k] for k in ("caption", "num_tokens", "embedding_dim") if k in caption_info},
         "quality_checks": qc,
+        "up_axis_estimate": up_estimate.to_dict(),
         "config": {
             "front_yaw_deg": cfg.front_yaw_deg,
             "front_axis": cfg.front_axis,
+            "up_axis": cfg.up_axis,
+            "stage_dir": stage_dir,
             "front_azimuth_half_span_deg": cfg.front_azimuth_half_span_deg,
             "min_elevation_deg": cfg.min_elevation_deg,
             "front_targets": cfg.front_targets,
@@ -414,6 +481,9 @@ def _build_config(args: argparse.Namespace) -> PrepareConfig:
             quantile=tuple(args.quantile),
             look_at_robust_center=True,
             target_anchor_min_angle_deg=0.0,
+            up_axis=tuple(args.up_axis) if args.up_axis is not None else None,
+            stage_dir=str(args.stage_dir.resolve()) if args.stage_dir is not None else None,
+            min_up_confidence=float(args.min_up_confidence),
         )
 
     # For sphere-ring / front_views, let Stage-1 anchors define upright; do not
@@ -443,6 +513,9 @@ def _build_config(args: argparse.Namespace) -> PrepareConfig:
         look_at_robust_center=True,
         target_anchor_min_angle_deg=0.0,
         sort_trajectory_smooth=False,
+        up_axis=tuple(args.up_axis) if args.up_axis is not None else None,
+        stage_dir=str(args.stage_dir.resolve()) if args.stage_dir is not None else None,
+        min_up_confidence=float(args.min_up_confidence),
     )
 
 

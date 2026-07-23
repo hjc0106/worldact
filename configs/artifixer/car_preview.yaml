@@ -1,0 +1,19 @@
+device: cuda
+
+prepare:
+  anchor_count: 6
+  min_anchor_count: 3
+  target_count: 32
+  horizontal_targets: 24
+  high_elevation_targets: 4
+  low_elevation_targets: 4
+
+  image_size: 512
+  min_mask_area_ratio: 0.0005
+  max_mask_area_ratio: 0.95
+  max_boundary_edges: 4
+
+  angular_dedup_deg: 10.0
+  target_anchor_min_angle_deg: 5.0
+  fov_deg: 60.0
+  camera_distance_scale: 2.2

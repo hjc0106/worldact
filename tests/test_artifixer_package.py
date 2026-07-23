@@ -13,7 +13,7 @@ from worldact.data.gaussians import GaussianParams, GaussianScene
 from worldact.data.masks import MaskSet, ObjectMask
 from worldact.data.poses import CameraPose
 from worldact.rendering.rasterizer import _ensure_ninja_on_path
-from worldact.stage2_artifixer.anchors import _render_rgb_alpha
+from worldact.stage2_artifixer.anchors import _render_rgb_alpha, object_centered_anchor_camera
 from worldact.stage2_artifixer.config import PrepareConfig
 from worldact.stage2_artifixer.inputs import load_stage_artifixer_input
 from worldact.stage2_artifixer.package import archive_package, prepare_object_package
@@ -110,6 +110,11 @@ def test_prepare_object_package(tmp_path: Path) -> None:
     assert manifest.object_id == "1"
     assert manifest.anchor_count >= 3
     assert manifest.target_count >= 4
+    anchors = json.loads((package_dir / "anchors.json").read_text(encoding="utf-8"))["anchors"]
+    for anchor in anchors:
+        assert anchor["fl_x"] == pytest.approx(anchor["fl_y"])
+        assert anchor["cx"] == pytest.approx((cfg.image_size - 1) * 0.5)
+        assert anchor["cy"] == pytest.approx((cfg.image_size - 1) * 0.5)
     result = validate_package_dir(package_dir)
     assert result.ok, result.errors
     archive = archive_package(package_dir)
@@ -143,3 +148,24 @@ def test_cuda_anchor_render_failure_does_not_fallback() -> None:
 
     with pytest.raises(RuntimeError, match="refusing to generate gray fallback"):
         _render_rgb_alpha(BrokenCudaScene(), camera)  # type: ignore[arg-type]
+
+
+def test_object_centered_anchor_camera_is_square_and_looks_at_origin() -> None:
+    source = CameraPose(
+        extrinsic=_look_at([10.0, -5.0, 3.0]),
+        intrinsic=torch.tensor([[900.0, 0.0, 12.0], [0.0, 450.0, 900.0], [0.0, 0.0, 1.0]]),
+        width=1920,
+        height=1080,
+    )
+    cfg = PrepareConfig(image_size=512, fov_deg=60.0)
+    direction = torch.tensor([1.0, -0.5, 0.3])
+
+    camera = object_centered_anchor_camera(source, direction, cfg)
+
+    assert camera.width == camera.height == 512
+    assert float(camera.intrinsic[0, 0]) == pytest.approx(float(camera.intrinsic[1, 1]))
+    assert float(camera.intrinsic[0, 2]) == pytest.approx(255.5)
+    assert float(camera.intrinsic[1, 2]) == pytest.approx(255.5)
+    c2w = camera.c2w
+    expected_forward = -c2w[:3, 3] / c2w[:3, 3].norm()
+    assert torch.allclose(c2w[:3, 2], expected_forward, atol=1e-5)

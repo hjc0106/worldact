@@ -15,7 +15,11 @@ from worldact.data.masks import ObjectMask
 from worldact.data.poses import CameraPose
 from worldact.stage2_artifixer.config import PrepareConfig
 from worldact.stage2_artifixer.contracts import SCHEMA_VERSION, AnchorCamera, AnchorsDocument
-from worldact.stage2_artifixer.normalization import c2w_matrix_list, world_to_local_camera
+from worldact.stage2_artifixer.normalization import (
+    c2w_matrix_list,
+    world_to_local_camera,
+    world_to_local_params,
+)
 
 
 @dataclass
@@ -61,6 +65,13 @@ def select_and_export_anchors(
             f"only {len(selected)} anchors passed filters; need at least {cfg.min_anchor_count}"
         )
 
+    mode = str(cfg.anchor_camera_mode).strip().lower()
+    if mode not in {"object_centered", "source_crop"}:
+        raise ValueError(
+            f"anchor_camera_mode={cfg.anchor_camera_mode!r} is not supported; "
+            "expected 'object_centered' or 'source_crop'"
+        )
+
     device = torch.device(render_device or object_scene.device)
     object_scene = GaussianScene(
         params=object_scene.params.to(device),
@@ -68,9 +79,42 @@ def select_and_export_anchors(
         metadata=dict(object_scene.metadata),
     )
     means_world = object_scene.params.means.detach().cpu()
+    local_scene = GaussianScene(
+        params=world_to_local_params(object_scene.params, norm),
+        camera_trajectory=[],
+        metadata={**object_scene.metadata, "frame": "local"},
+    )
     exported: list[SelectedAnchor] = []
 
     for cand in selected:
+        if mode == "object_centered":
+            source_camera = world_scene.camera_trajectory[cand.view_index]
+            camera_local = object_centered_anchor_camera(source_camera, cand.direction, cfg).to(device)
+            rgb_t, alpha_t = _render_rgb_alpha(local_scene, camera_local)
+            alpha = alpha_t.float().clamp(0.0, 1.0)
+            crop_mask = alpha > float(cfg.anchor_alpha_threshold)
+            area_ratio = float(crop_mask.float().mean().item())
+            if area_ratio <= 1e-5 or area_ratio >= 0.98:
+                continue
+            if count_boundary_edges(crop_mask) > cfg.max_boundary_edges:
+                continue
+
+            # The shared rasterizer renders over white. Remove that background
+            # contribution to obtain a black-premultiplied object image while
+            # retaining soft alpha edges.
+            crop_rgb = (rgb_t - (1.0 - alpha).unsqueeze(-1)).clamp(0.0, 1.0)
+            exported.append(
+                SelectedAnchor(
+                    source_view_index=cand.view_index,
+                    camera_local=camera_local.to("cpu"),
+                    rgb=(crop_rgb.detach().cpu().numpy() * 255).astype(np.uint8),
+                    mask=(crop_mask.detach().cpu().numpy().astype(np.uint8) * 255),
+                    mask_area_ratio=area_ratio,
+                    quality_score=cand.quality_score,
+                )
+            )
+            continue
+
         camera = world_scene.camera_trajectory[cand.view_index].to(device)
         rgb_t, alpha_t = _render_rgb_alpha(object_scene, camera)
         mask = cand.mask.to(device)
@@ -130,15 +174,20 @@ def select_and_export_anchors(
         rgb_name = f"frame_{i:03d}.png"
         mask_name = f"frame_{i:03d}_mask.png"
         k = item.camera_local.intrinsic
-        rgb_np, mask_np, fl_x, fl_y, cx, cy = _reframe_crop_to_principal_point(
-            item.rgb,
-            item.mask,
-            fl_x=float(k[0, 0]),
-            fl_y=float(k[1, 1]),
-            cx=float(k[0, 2]),
-            cy=float(k[1, 2]),
-            image_size=cfg.image_size,
-        )
+        if mode == "source_crop":
+            rgb_np, mask_np, fl_x, fl_y, cx, cy = _reframe_crop_to_principal_point(
+                item.rgb,
+                item.mask,
+                fl_x=float(k[0, 0]),
+                fl_y=float(k[1, 1]),
+                cx=float(k[0, 2]),
+                cy=float(k[1, 2]),
+                image_size=cfg.image_size,
+            )
+        else:
+            rgb_np, mask_np = item.rgb, item.mask
+            fl_x, fl_y = float(k[0, 0]), float(k[1, 1])
+            cx, cy = float(k[0, 2]), float(k[1, 2])
         Image.fromarray(rgb_np).save(anchors_dir / rgb_name)
         Image.fromarray(mask_np, mode="L").save(anchors_dir / mask_name)
         if not (0.0 < cx < float(cfg.image_size) and 0.0 < cy < float(cfg.image_size)):
@@ -166,6 +215,58 @@ def select_and_export_anchors(
     doc = AnchorsDocument(schema_version=SCHEMA_VERSION, image_size=cfg.image_size, anchors=anchors)
     (output_dir / "anchors.json").write_text(doc.model_dump_json(indent=2), encoding="utf-8")
     return doc
+
+
+def object_centered_anchor_camera(
+    source_camera: CameraPose,
+    direction: torch.Tensor,
+    cfg: PrepareConfig,
+) -> CameraPose:
+    """Build a square-pixel local camera aimed at the normalized object origin."""
+    size = int(cfg.image_size)
+    fov = math.radians(float(cfg.fov_deg))
+    focal = size / (2.0 * math.tan(fov * 0.5))
+    principal = (size - 1) * 0.5
+    half_extent = math.sqrt(3.0)
+    distance = max(
+        float(cfg.camera_distance_scale),
+        half_extent / max(math.tan(fov * 0.5), 1e-4) * 1.15,
+        1.5,
+    )
+
+    view_dir = direction.detach().cpu().float()
+    view_dir = view_dir / view_dir.norm().clamp_min(1e-6)
+    eye = view_dir * distance
+    forward = -view_dir
+
+    source_c2w = source_camera.c2w.detach().cpu().float()
+    up_hint = -source_c2w[:3, 1]
+    up_hint = up_hint / up_hint.norm().clamp_min(1e-6)
+    right = torch.linalg.cross(forward, up_hint)
+    if float(right.norm()) < 1e-5:
+        fallback_up = torch.tensor([0.0, 0.0, 1.0])
+        if abs(float(torch.dot(forward, fallback_up))) > 0.98:
+            fallback_up = torch.tensor([0.0, 1.0, 0.0])
+        right = torch.linalg.cross(forward, fallback_up)
+    right = right / right.norm().clamp_min(1e-6)
+    true_up = torch.linalg.cross(right, forward)
+    true_up = true_up / true_up.norm().clamp_min(1e-6)
+
+    c2w = torch.eye(4, dtype=torch.float32)
+    c2w[:3, 0] = right
+    c2w[:3, 1] = -true_up
+    c2w[:3, 2] = forward
+    c2w[:3, 3] = eye
+    intrinsic = torch.tensor(
+        [[focal, 0.0, principal], [0.0, focal, principal], [0.0, 0.0, 1.0]],
+        dtype=torch.float32,
+    )
+    return CameraPose(
+        extrinsic=torch.linalg.inv(c2w),
+        intrinsic=intrinsic,
+        width=size,
+        height=size,
+    )
 
 
 def score_anchor_candidates(

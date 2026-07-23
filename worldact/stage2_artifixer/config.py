@@ -43,8 +43,12 @@ class PrepareConfig:
     # are unset, cameras keep the legacy world-Z up convention.
     front_yaw_deg: float | None = None
     front_axis: tuple[float, float, float] | None = None
-    # Vehicle upright axis. None → PCA (non-length axis most aligned with +Z).
+    # Vehicle upright axis. None → scene ground / robust PCA / camera hint.
     up_axis: tuple[float, float, float] | None = None
+    # Optional Stage-1 directory for shared scene-ground gravity estimation.
+    stage_dir: str | None = None
+    # Refuse auto trajectories below this upright-axis confidence unless manual.
+    min_up_confidence: float = 0.45
     # Sphere-ring orbit: cameras on a sphere concentric with the object
     # circumsphere, at fixed elevation above the vehicle equator.
     sphere_ring: bool = False

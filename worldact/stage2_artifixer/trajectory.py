@@ -154,40 +154,58 @@ def resolve_up_axis(
     *,
     points_local: torch.Tensor | None = None,
     up_hint: torch.Tensor | None = None,
-) -> torch.Tensor:
+    stage_dir: str | None = None,
+    local_to_world: torch.Tensor | None = None,
+    camera_centers_local: torch.Tensor | None = None,
+    opacities: torch.Tensor | None = None,
+    scales: torch.Tensor | None = None,
+    return_estimate: bool = False,
+):
     """Vehicle upright axis.
 
     Priority:
       1. ``cfg.up_axis`` manual override
-      2. ``up_hint`` (e.g. mean image-up of Stage-1 anchors)
-      3. PCA smallest-eigenvalue axis (height for elongated objects)
-      4. +Z
+      2. Scene ground plane from Stage-1 ``stage_dir`` (shared gravity)
+      3. Robust PCA + support-surface scoring on the object
+      4. ``up_hint`` (e.g. mean image-up of Stage-1 anchors)
+      5. +Z fallback
 
     For cars, PCA order is typically length > width > height, so the *smallest*
     eigenvector is upright — not the mid-axis most aligned with +Z.
     """
-    if cfg.up_axis is not None:
-        up = torch.tensor(list(cfg.up_axis), dtype=torch.float32)
-        return up / up.norm().clamp_min(1e-6)
+    from worldact.stage2_artifixer.up_axis import estimate_up_axis
 
-    if up_hint is not None and float(up_hint.float().norm()) > 1e-6:
-        up = up_hint.float().reshape(3)
-        return up / up.norm().clamp_min(1e-6)
-
+    pts_np = None
     if points_local is not None and points_local.numel() >= 9:
-        pts = points_local.detach().float().reshape(-1, 3)
-        center = pts.mean(dim=0)
-        centered = pts - center
-        cov = centered.T @ centered / max(pts.shape[0], 1)
-        _evals, evecs = torch.linalg.eigh(cov)
-        up = evecs[:, 0]  # smallest eigenvalue ≈ height
-        prefer = torch.tensor([0.0, -1.0, 0.0], dtype=torch.float32)
-        if abs(float(torch.dot(up, prefer))) < 0.2:
-            prefer = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)
-        if float(torch.dot(up, prefer)) < 0:
-            up = -up
-        return up / up.norm().clamp_min(1e-6)
-    return torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)
+        pts_np = points_local.detach().float().cpu().numpy().reshape(-1, 3)
+    hint_np = None
+    if up_hint is not None and float(up_hint.float().norm()) > 1e-6:
+        hint_np = up_hint.detach().float().cpu().numpy().reshape(3)
+    l2w_np = None
+    if local_to_world is not None:
+        l2w_np = local_to_world.detach().float().cpu().numpy()
+    cams_np = None
+    if camera_centers_local is not None and camera_centers_local.numel() > 0:
+        cams_np = camera_centers_local.detach().float().cpu().numpy().reshape(-1, 3)
+    opac_np = None if opacities is None else opacities.detach().float().cpu().numpy().reshape(-1)
+    scales_np = None if scales is None else scales.detach().float().cpu().numpy().reshape(-1, 3)
+
+    estimate = estimate_up_axis(
+        stage_dir=stage_dir or getattr(cfg, "stage_dir", None),
+        points_local=pts_np,
+        opacities=opac_np,
+        scales=scales_np,
+        camera_centers_local=cams_np,
+        local_to_world=l2w_np,
+        manual_up=cfg.up_axis,
+        camera_up_hint=hint_np,
+        min_confidence=float(getattr(cfg, "min_up_confidence", 0.45)),
+    )
+    up = torch.tensor(estimate.up_axis, dtype=torch.float32)
+    up = up / up.norm().clamp_min(1e-6)
+    if return_estimate:
+        return up, estimate
+    return up
 
 
 def resolve_front_axis(
