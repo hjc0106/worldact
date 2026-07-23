@@ -5,14 +5,64 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Stable multi-GPU / NCCL defaults (same as run_art*.sh).
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+os.environ.setdefault("NCCL_SHM_DISABLE", "0")
+os.environ.setdefault("NCCL_CROSS_NIC", "1")
+
+WORLDACT_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = WORLDACT_ROOT.parent
+for path in (REPO_ROOT, WORLDACT_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from worldact.stage2_artifixer.config import ArtiFixerRefinementConfig, load_artifixer_config
 from worldact.stage2_artifixer.runner import ArtiFixerRefinementRunner
 from worldact.utils.logging import get_logger, setup_logging
+
+try:
+    from model_training.utils.gpu_cleanup import (
+        cleanup_distributed_cuda,
+        install_termination_cleanup_handlers,
+        release_cuda_memory,
+        restore_signal_handlers,
+    )
+except ImportError:  # pragma: no cover - host env without ArtiFixer training utils
+    def release_cuda_memory() -> None:
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def cleanup_distributed_cuda() -> None:
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
+        release_cuda_memory()
+
+    def install_termination_cleanup_handlers() -> dict:
+        return {}
+
+    def restore_signal_handlers(_previous_handlers: dict) -> None:
+        return
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -65,30 +115,46 @@ def main(argv: list[str] | None = None) -> int:
         cfg.prepare.model = args.model
         cfg.service.model = args.model
 
-    runner = ArtiFixerRefinementRunner(
-        ply_path=args.ply,
-        stage_dir=args.stage_dir,
-        object_id=args.object_id,
-        output_dir=args.output_dir,
-        config=cfg,
-        cameras_path=args.cameras,
-        object_ply_dir=args.object_ply_dir,
-    )
-    result = runner.run(args.phase)  # type: ignore[arg-type]
-    payload = {
-        "phase": result.phase,
-        "object_id": result.object_id,
-        "output_dir": str(result.output_dir),
-        "package_dir": str(result.package_dir) if result.package_dir else None,
-        "archive_path": str(result.archive_path) if result.archive_path else None,
-        "import_status": result.import_status,
-        "job_id": result.job.job_id if result.job else None,
-        "details": result.details,
-    }
-    log.info("done: %s", json.dumps(payload))
-    print(json.dumps(payload, indent=2))
-    return 0
+    runner = None
+    try:
+        runner = ArtiFixerRefinementRunner(
+            ply_path=args.ply,
+            stage_dir=args.stage_dir,
+            object_id=args.object_id,
+            output_dir=args.output_dir,
+            config=cfg,
+            cameras_path=args.cameras,
+            object_ply_dir=args.object_ply_dir,
+        )
+        result = runner.run(args.phase)  # type: ignore[arg-type]
+        payload = {
+            "phase": result.phase,
+            "object_id": result.object_id,
+            "output_dir": str(result.output_dir),
+            "package_dir": str(result.package_dir) if result.package_dir else None,
+            "archive_path": str(result.archive_path) if result.archive_path else None,
+            "import_status": result.import_status,
+            "job_id": result.job.job_id if result.job else None,
+            "details": result.details,
+        }
+        log.info("done: %s", json.dumps(payload))
+        print(json.dumps(payload, indent=2))
+        return 0
+    except Exception:
+        # Match exp.py: free CUDA fragments before the traceback exits the process.
+        release_cuda_memory()
+        raise
+    finally:
+        runner = None
+        release_cuda_memory()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    previous_signal_handlers = install_termination_cleanup_handlers()
+    try:
+        raise SystemExit(main())
+    finally:
+        try:
+            cleanup_distributed_cuda()
+        finally:
+            restore_signal_handlers(previous_signal_handlers)

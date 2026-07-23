@@ -61,8 +61,13 @@ def select_and_export_anchors(
     candidates = score_anchor_candidates(world_scene, object_scene, obj_mask, cfg)
     selected = angular_dedup_select(candidates, cfg.anchor_count, cfg.angular_dedup_deg, cfg.min_anchor_count)
     if len(selected) < cfg.min_anchor_count:
+        n_mask_views = 0 if obj_mask is None else len(obj_mask.view_indices)
         raise ValueError(
-            f"only {len(selected)} anchors passed filters; need at least {cfg.min_anchor_count}"
+            f"only {len(selected)} anchors passed filters; need at least {cfg.min_anchor_count}. "
+            f"scored_candidates={len(candidates)}, stage_mask_views={n_mask_views}, "
+            f"cameras={len(world_scene.camera_trajectory)}. "
+            "Wide-scene Stage-1 masks are often <<1% of the frame; if this persists, "
+            "set prepare.min_mask_area_ratio lower (e.g. 0.0005) or check masks.pt."
         )
 
     mode = str(cfg.anchor_camera_mode).strip().lower()
@@ -282,26 +287,45 @@ def score_anchor_candidates(
     means = object_scene.params.means.detach().cpu().float()
     center = means.mean(dim=0)
     candidates: list[AnchorCandidate] = []
+    # Stage-1 SAM masks on wide outdoor frames are often <<1% of the image.
+    # ``min_mask_area_ratio`` is primarily a post-crop fill target (~0.2), so
+    # applying it directly to full-frame Stage-1 masks rejects every view.
+    stage_min_area = min(float(cfg.min_mask_area_ratio) * 0.5, 1e-4)
+    stage_max_area = min(0.95, float(cfg.max_mask_area_ratio) * 1.5)
+    min_mask_pixels = 32
 
     for view_idx, camera in enumerate(cameras):
         mask = None
+        has_stage_mask = False
         if obj_mask is not None:
             mask = obj_mask.get_mask(view_idx)
+            has_stage_mask = mask is not None
         if mask is None:
-            # Synthetic full-frame soft mask from projected means coverage estimate.
-            mask = torch.ones(camera.height, camera.width)
+            # Soft coverage from projected object means (not a full-frame ones mask).
+            mask = _projected_coverage_mask(means, camera)
+            if mask is None:
+                continue
         mask = mask.float()
-        area_ratio = float((mask > 0.5).float().mean().item())
-        if area_ratio < cfg.min_mask_area_ratio * 0.5 or area_ratio > min(0.95, cfg.max_mask_area_ratio * 1.5):
-            continue
-        boundary = count_boundary_edges(mask > 0.5)
+        fg = mask > 0.5
+        area_ratio = float(fg.float().mean().item())
+        pixel_count = int(fg.sum().item())
+        if has_stage_mask:
+            if pixel_count < min_mask_pixels or area_ratio > stage_max_area:
+                continue
+        else:
+            if area_ratio < stage_min_area or area_ratio > stage_max_area or pixel_count < min_mask_pixels:
+                continue
+        boundary = count_boundary_edges(fg)
         if boundary > cfg.max_boundary_edges:
             continue
         sharpness = _mask_sharpness(mask)
         c2w = camera.c2w.detach().cpu().float()
         direction = c2w[:3, 3] - center
         direction = direction / direction.norm().clamp_min(1e-6)
-        quality = area_ratio * 0.55 + (1.0 - boundary / 4.0) * 0.25 + min(sharpness, 1.0) * 0.20
+        # Prefer larger Stage-1 masks, but don't let absolute area dominate quality
+        # when all candidates are tiny outdoor crops.
+        area_term = min(area_ratio / max(stage_min_area, 1e-6), 1.0) if has_stage_mask else area_ratio
+        quality = area_term * 0.55 + (1.0 - boundary / 4.0) * 0.25 + min(sharpness, 1.0) * 0.20
         candidates.append(
             AnchorCandidate(
                 view_index=view_idx,
@@ -316,6 +340,24 @@ def score_anchor_candidates(
 
     candidates.sort(key=lambda c: c.quality_score, reverse=True)
     return candidates
+
+
+def _projected_coverage_mask(means: torch.Tensor, camera: CameraPose) -> torch.Tensor | None:
+    """Binary mask with projected Gaussian means marked as foreground."""
+    h, w = int(camera.height), int(camera.width)
+    pts = _project_points(means, camera.extrinsic.cpu(), camera.intrinsic.cpu(), w, h)
+    if pts is None or pts.numel() == 0:
+        return None
+    mask = torch.zeros(h, w, dtype=torch.float32)
+    uv = pts.long()
+    for u, v in uv:
+        if 0 <= int(u) < w and 0 <= int(v) < h:
+            mask[int(v), int(u)] = 1.0
+    # Dilate slightly so tiny point splat masks pass pixel-count checks.
+    if mask.any():
+        k = torch.ones(1, 1, 5, 5, dtype=torch.float32)
+        mask = torch.nn.functional.conv2d(mask[None, None], k, padding=2).clamp(0, 1)[0, 0]
+    return mask
 
 
 def angular_dedup_select(

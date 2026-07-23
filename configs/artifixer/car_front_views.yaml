@@ -16,3 +16,9 @@ prepare:
   edge_margin: 0.12
   quantile: [0.02, 0.98]
   target_anchor_min_angle_deg: 0.0
+  # Stage-1 SAM masks on parking-lot frames cover ~0.1%–0.5% of the image.
+  min_mask_area_ratio: 0.0005
+  max_mask_area_ratio: 0.95
+  max_boundary_edges: 4
+  angular_dedup_deg: 10.0
+  camera_distance_scale: 2.2

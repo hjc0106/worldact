@@ -46,6 +46,8 @@ class StageArtifixerInput:
     masks: MaskSet | None
     object_ply_paths: dict[str, Path]
     cameras_path: Path | None
+    # Explicit ``--ply`` from the CLI (may be a refined Stage-2 object PLY).
+    region_ply_path: Path | None = None
 
 
 def resolve_cameras_path(stage_dir: Path, explicit: Path | str | None = None) -> Path | None:
@@ -84,6 +86,13 @@ def load_stage_artifixer_input(
 
     search_dir = Path(object_ply_dir) if object_ply_dir is not None else stage_dir
     object_ply_paths = discover_object_plys(search_dir)
+    # CLI ``--ply`` wins when it is an object_*.ply for a known id (e.g. Stage-2
+    # ``*_final.ply``). Otherwise prepare silently reloads the Stage-1 discovery
+    # path and ignores the refined geometry.
+    inferred_id = _infer_object_id(ply_path.stem)
+    if inferred_id is not None:
+        object_ply_paths[str(inferred_id)] = ply_path.resolve()
+
     return StageArtifixerInput(
         stage_dir=stage_dir,
         scene=scene,
@@ -91,6 +100,7 @@ def load_stage_artifixer_input(
         masks=masks,
         object_ply_paths=object_ply_paths,
         cameras_path=cam_path,
+        region_ply_path=ply_path.resolve(),
     )
 
 
@@ -135,15 +145,29 @@ def load_object_scene(
     object_id: str,
     *,
     device: str | torch.device | None = None,
+    ply_path: Path | str | None = None,
 ) -> GaussianScene:
     record = find_object_record(stage_input.objects, object_id)
     device = device or stage_input.scene.device
-    ply_path = stage_input.object_ply_paths.get(str(object_id))
-    if ply_path is not None and ply_path.exists():
-        scene = GaussianScene.from_ply(ply_path)
+
+    resolved: Path | None = Path(ply_path) if ply_path is not None else None
+    if resolved is None:
+        # Prefer CLI ``--ply`` when it targets this object_id.
+        region = stage_input.region_ply_path
+        if region is not None and _infer_object_id(region.stem) == str(object_id):
+            resolved = region
+        else:
+            resolved = stage_input.object_ply_paths.get(str(object_id))
+
+    if resolved is not None and resolved.exists():
+        scene = GaussianScene.from_ply(resolved)
         scene.params = scene.params.to(device)
         scene.camera_trajectory = [cam.to(device) for cam in stage_input.scene.camera_trajectory]
-        scene.metadata = {"object_id": record.object_id, "name": record.name, "source_ply": str(ply_path)}
+        scene.metadata = {
+            "object_id": record.object_id,
+            "name": record.name,
+            "source_ply": str(resolved),
+        }
         return scene
 
     if record.source_gaussian_indices:
