@@ -25,7 +25,51 @@ class PrepareConfig:
     fov_deg: float = 60.0
     high_elevation_deg: float = 45.0
     low_elevation_deg: float = -20.0
+    # Optional elevation bands (deg). When set, override the fixed *_elevation_deg
+    # values and sample evenly across [lo, hi] for that ring.
+    horizontal_elevation_range_deg: tuple[float, float] | None = None
+    high_elevation_range_deg: tuple[float, float] | None = None
+    # Hard floor for all generated target elevations (deg). Use e.g. 8.0 to
+    # forbid underside / negative-pitch cameras.
+    min_elevation_deg: float = -90.0
     camera_distance_scale: float = 2.2
+    # Optional per-camera distance jitter around the fitted base distance.
+    camera_distance_scale_range: tuple[float, float] | None = None
+    # Keep this fraction of the image as empty border when fitting distance.
+    edge_margin: float = 0.12
+    # Aim cameras at the robust (quantile) object center instead of the origin.
+    look_at_robust_center: bool = False
+    # Manual vehicle front direction in local XY. Prefer front_yaw_deg; if both
+    # are unset, cameras keep the legacy world-Z up convention.
+    front_yaw_deg: float | None = None
+    front_axis: tuple[float, float, float] | None = None
+    # Vehicle upright axis. None → PCA (non-length axis most aligned with +Z).
+    up_axis: tuple[float, float, float] | None = None
+    # Sphere-ring orbit: cameras on a sphere concentric with the object
+    # circumsphere, at fixed elevation above the vehicle equator.
+    sphere_ring: bool = False
+    ring_elevation_deg: float = 12.0
+    # Shift look-at toward +up by this fraction of circumradius (avoids underbody).
+    look_at_up_bias: float = 0.08
+    # 1.0 places cameras on the circumsphere; >1 moves them outward.
+    circumradius_scale: float = 1.0
+    # When set, restrict target azimuth to front_yaw ± this half-span (deg).
+    front_azimuth_half_span_deg: float | None = None
+    # Optional front-hemisphere rings (used when > 0). Counts are in addition to
+    # the legacy horizontal/high/low rings unless those are set to 0.
+    front_targets: int = 0
+    front_elevation_range_deg: tuple[float, float] = (25.0, 45.0)
+    side_targets: int = 0
+    side_elevation_range_deg: tuple[float, float] = (25.0, 35.0)
+    overhead_targets: int = 0
+    overhead_elevation_range_deg: tuple[float, float] = (50.0, 60.0)
+    # Sort generated frames into a smooth azimuth/elevation path.
+    sort_trajectory_smooth: bool = False
+    # object_centered keeps Stage-1 view directions for selection, but renders
+    # from fresh cameras aimed at the normalized object. source_crop retains
+    # the legacy Stage-1-camera crop path.
+    anchor_camera_mode: str = "object_centered"
+    anchor_alpha_threshold: float = 0.01
     quantile: tuple[float, float] = (0.02, 0.98)
     base_reconstruction_steps: int = 1000
     distillation_steps: int = 5000
@@ -79,7 +123,21 @@ def load_artifixer_config(path: Path | str | None = None, overrides: dict[str, A
 def _from_dict(raw: dict[str, Any]) -> ArtiFixerRefinementConfig:
     prepare_raw = dict(raw.get("prepare") or raw.get("artifixer_prepare") or {})
     service_raw = dict(raw.get("artifixer_service") or raw.get("service") or {})
-    prepare = PrepareConfig(**{k: v for k, v in prepare_raw.items() if k in PrepareConfig.__dataclass_fields__})
+    prepare_kwargs = {k: v for k, v in prepare_raw.items() if k in PrepareConfig.__dataclass_fields__}
+    for key in (
+        "horizontal_elevation_range_deg",
+        "high_elevation_range_deg",
+        "camera_distance_scale_range",
+        "quantile",
+        "front_axis",
+        "up_axis",
+        "front_elevation_range_deg",
+        "side_elevation_range_deg",
+        "overhead_elevation_range_deg",
+    ):
+        if key in prepare_kwargs and prepare_kwargs[key] is not None:
+            prepare_kwargs[key] = tuple(prepare_kwargs[key])
+    prepare = PrepareConfig(**prepare_kwargs)
     service = ArtiFixerServiceConfig(
         **{k: v for k, v in service_raw.items() if k in ArtiFixerServiceConfig.__dataclass_fields__}
     )

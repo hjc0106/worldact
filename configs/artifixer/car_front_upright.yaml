@@ -1,0 +1,29 @@
+device: cuda
+
+prepare:
+  anchor_count: 5
+  min_anchor_count: 3
+  target_count: 32
+  horizontal_targets: 0
+  high_elevation_targets: 0
+  low_elevation_targets: 0
+  front_targets: 20
+  side_targets: 8
+  overhead_targets: 4
+
+  image_size: 512
+  fov_deg: 60.0
+  front_yaw_deg: 0.0
+  front_azimuth_half_span_deg: 110.0
+  front_elevation_range_deg: [25.0, 45.0]
+  side_elevation_range_deg: [25.0, 35.0]
+  overhead_elevation_range_deg: [50.0, 60.0]
+  min_elevation_deg: 20.0
+  sort_trajectory_smooth: true
+  look_at_robust_center: true
+
+  camera_distance_scale: 3.0
+  camera_distance_scale_range: [2.9, 3.2]
+  edge_margin: 0.15
+  quantile: [0.02, 0.98]
+  target_anchor_min_angle_deg: 0.0

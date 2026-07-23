@@ -155,7 +155,7 @@ class TrajectoryFrame(BaseModel):
     cy: float
     w: int
     h: int
-    kind: Literal["horizontal", "high", "low"] = "horizontal"
+    kind: Literal["horizontal", "high", "low", "front", "side", "overhead"] = "horizontal"
 
 
 class TrajectoryDocument(BaseModel):
