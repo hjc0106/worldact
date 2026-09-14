@@ -109,12 +109,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-distance-scale", type=float, default=3.0)
     parser.add_argument("--camera-distance-scale-range", type=float, nargs=2, default=(2.9, 3.2))
     parser.add_argument("--edge-margin", type=float, default=0.15)
+    parser.add_argument(
+        "--allow-alpha-edge-contact",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow scene renders to touch image edges without failing trajectory QC.",
+    )
     parser.add_argument("--quantile", type=float, nargs=2, default=(0.02, 0.98))
     parser.add_argument("--min-elevation-deg", type=float, default=None)
     parser.add_argument("--keep-source-anchors", action="store_true")
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--skip-render", action="store_true")
     parser.add_argument("--skip-qc", action="store_true")
+    parser.add_argument(
+        "--emit_gaussian_hits",
+        action="store_true",
+        help="Also render a per-pixel Gaussian hit-count map (gaussian_hits/*.npy) alongside renders/opacity.",
+    )
+    parser.add_argument(
+        "--emit_visible_gaussian_hits",
+        action="store_true",
+        help="Also render exact visible-contributor counts (visible_gaussian_hits/*.npy).",
+    )
+    parser.add_argument(
+        "--emit_effective_gaussian_hits",
+        action="store_true",
+        help="Also render effective contributor counts (effective_gaussian_hits/*.npy).",
+    )
+    parser.add_argument(
+        "--emit_projected_gaussian_resolution",
+        action="store_true",
+        help="Also render weighted inverse projected Gaussian footprints.",
+    )
     return parser
 
 
@@ -224,12 +250,16 @@ def main(argv: list[str] | None = None) -> int:
     images_dir = output / "images"
     render_dir = output / "recon_results" / scene_id / "reconstruction" / scene_id / "ours_0" / "renders"
     opacity_dir = output / "recon_results" / scene_id / "reconstruction" / scene_id / "ours_0" / "opacity"
+    gaussian_hits_dir = output / "recon_results" / scene_id / "reconstruction" / scene_id / "ours_0" / "gaussian_hits"
+    visible_gaussian_hits_dir = output / "recon_results" / scene_id / "reconstruction" / scene_id / "ours_0" / "visible_gaussian_hits"
+    effective_gaussian_hits_dir = output / "recon_results" / scene_id / "reconstruction" / scene_id / "ours_0" / "effective_gaussian_hits"
+    projected_resolution_dir = output / "recon_results" / scene_id / "reconstruction" / scene_id / "ours_0" / "projected_gaussian_resolution"
     captions_dir = output / "captions" / scene_id
     colmap_dir = output / "synthetic_colmap"
     sparse_dir = colmap_dir / "sparse" / "0"
     initial_dir = output / "initial_object"
     nerfstudio_dir = output / "nerfstudio"
-    for path in (
+    mkdir_paths = [
         images_dir,
         render_dir,
         opacity_dir,
@@ -238,7 +268,16 @@ def main(argv: list[str] | None = None) -> int:
         initial_dir,
         nerfstudio_dir,
         colmap_dir / "images",
-    ):
+    ]
+    if args.emit_gaussian_hits:
+        mkdir_paths.append(gaussian_hits_dir)
+    if args.emit_visible_gaussian_hits:
+        mkdir_paths.append(visible_gaussian_hits_dir)
+    if args.emit_effective_gaussian_hits:
+        mkdir_paths.append(effective_gaussian_hits_dir)
+    if args.emit_projected_gaussian_resolution:
+        mkdir_paths.append(projected_resolution_dir)
+    for path in mkdir_paths:
         path.mkdir(parents=True, exist_ok=True)
 
     shutil.copy2(ply_path, initial_dir / "object_local.ply")
@@ -334,6 +373,10 @@ def main(argv: list[str] | None = None) -> int:
             render_dir,
             opacity_dir,
             device=args.device,
+            gaussian_hits_dir=gaussian_hits_dir if args.emit_gaussian_hits else None,
+            visible_gaussian_hits_dir=visible_gaussian_hits_dir if args.emit_visible_gaussian_hits else None,
+            effective_gaussian_hits_dir=effective_gaussian_hits_dir if args.emit_effective_gaussian_hits else None,
+            projected_resolution_dir=projected_resolution_dir if args.emit_projected_gaussian_resolution else None,
         )
         if regenerate_anchors:
             # Anchors also serve as conditioning RGB in images/.
@@ -415,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
             front_axis=None if front_axis is None else front_axis.detach().cpu().numpy(),
             up_axis=up_axis.detach().cpu().numpy(),
             mode=args.mode,
+            allow_alpha_edge_contact=args.allow_alpha_edge_contact,
         )
 
     summary = {
@@ -439,12 +483,16 @@ def main(argv: list[str] | None = None) -> int:
             "stage_dir": stage_dir,
             "front_azimuth_half_span_deg": cfg.front_azimuth_half_span_deg,
             "min_elevation_deg": cfg.min_elevation_deg,
+            "ring_elevation_deg": cfg.ring_elevation_deg,
+            "circumradius_scale": cfg.circumradius_scale,
+            "look_at_up_bias": cfg.look_at_up_bias,
             "front_targets": cfg.front_targets,
             "side_targets": cfg.side_targets,
             "overhead_targets": cfg.overhead_targets,
             "camera_distance_scale": cfg.camera_distance_scale,
             "camera_distance_scale_range": cfg.camera_distance_scale_range,
             "edge_margin": cfg.edge_margin,
+            "allow_alpha_edge_contact": args.allow_alpha_edge_contact,
         },
     }
     write_json(output / "regenerate_summary.json", summary)
@@ -627,6 +675,7 @@ def run_quality_checks(
     front_axis: np.ndarray | None,
     up_axis: np.ndarray | None,
     mode: str,
+    allow_alpha_edge_contact: bool,
 ) -> dict[str, Any]:
     import torch
 
@@ -713,7 +762,7 @@ def run_quality_checks(
     checks = {
         "min_elevation_ok": bool((elev_arr >= min_elevation_deg - 1e-3).all()) if elev_arr.size else False,
         "cameras_above_vehicle_equator": above_equator == len(target_indices),
-        "alpha_not_touching_edges": edge_hits == 0,
+        "alpha_not_touching_edges": edge_hits == 0 or allow_alpha_edge_contact,
         "rgb_non_empty": empty_rgb == 0,
         "opacity_non_empty": empty_opacity == 0,
         "no_low_kind_frames": all(k != "low" for k in (f.kind for f in trajectory.frames)),
@@ -757,6 +806,7 @@ def run_quality_checks(
             "std": float(area_arr.std()) if area_arr.size else None,
         },
         "edge_hits": edge_hits,
+        "alpha_edge_contact_allowed": allow_alpha_edge_contact,
         "empty_rgb": empty_rgb,
         "empty_opacity": empty_opacity,
         "preview_mosaic": str(mosaic_path.name) if mosaic_path.is_file() else None,

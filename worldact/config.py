@@ -70,7 +70,7 @@ class SAM3Config:
     confidence_threshold: float = 0.45
     max_candidates_per_view: int = 5
     min_candidate_quality: float = 0.0
-    instance_strategy: str = "largest"  # largest | best_score | union
+    instance_strategy: str = "largest"  # largest | best_score | best_quality | union
     mode: str = "image"
     component_filter: SAM3ComponentFilterConfig = field(default_factory=SAM3ComponentFilterConfig)
 

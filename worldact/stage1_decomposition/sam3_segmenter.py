@@ -118,6 +118,9 @@ class SAM3Segmenter:
         if strategy == "best_score" and scores is not None and scores.numel() > 0:
             idx = int(torch.argmax(scores).item())
             return candidates.candidates[idx]
+        if strategy == "best_quality" and candidates.qualities is not None and candidates.qualities.numel() > 0:
+            idx = int(torch.argmax(candidates.qualities).item())
+            return candidates.candidates[idx]
         areas = masks.flatten(1).sum(dim=1)
         idx = int(torch.argmax(areas).item())
         return candidates.candidates[idx]
@@ -283,6 +286,41 @@ class SAM3Segmenter:
         edge_penalty = 1.0 if area > 0 else 0.0
         return float(score) * size_prior * compactness * edge_penalty
 
-    def _to_pil(self, image: torch.Tensor) -> Image.Image:
-        arr = (image.detach().cpu().clamp(0, 1).numpy() * 255).astype("uint8")
-        return Image.fromarray(arr)
+    @staticmethod
+    def _to_pil(image: torch.Tensor) -> Image.Image:
+        """Convert one tensor image to RGB PIL, accepting HWC or CHW layouts."""
+        tensor = image.detach().cpu()
+        if tensor.ndim == 4:
+            if tensor.shape[0] != 1:
+                raise ValueError(f"SAM3 expects one image, got batch shape {tuple(tensor.shape)}")
+            tensor = tensor[0]
+
+        if tensor.ndim == 3:
+            channel_sizes = (1, 3, 4)
+            if tensor.shape[-1] in channel_sizes:
+                # Preserve the HWC layout used by WorldAct rendered views. In
+                # the rare ambiguous case where both ends look like channels,
+                # prefer HWC for backward compatibility.
+                pass
+            elif tensor.shape[0] in channel_sizes:
+                tensor = tensor.permute(1, 2, 0)
+            else:
+                raise ValueError(
+                    "SAM3 image must have 1, 3, or 4 channels in HWC/CHW layout, "
+                    f"got shape {tuple(tensor.shape)}"
+                )
+            if tensor.shape[-1] == 1:
+                tensor = tensor[..., 0]
+        elif tensor.ndim != 2:
+            raise ValueError(f"SAM3 image must be HW, HWC, CHW, or a batch of one; got {tuple(tensor.shape)}")
+
+        if torch.is_floating_point(tensor):
+            pixels = (tensor.float().clamp(0.0, 1.0) * 255.0).round().to(torch.uint8)
+        elif tensor.dtype == torch.bool:
+            pixels = tensor.to(torch.uint8) * 255
+        elif tensor.dtype == torch.uint8:
+            pixels = tensor
+        else:
+            pixels = tensor.clamp(0, 255).to(torch.uint8)
+
+        return Image.fromarray(pixels.contiguous().numpy()).convert("RGB")
